@@ -1,0 +1,5 @@
+syntax: glob
+
+*.o
+mdns-repeater
+ 
