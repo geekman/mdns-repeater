@@ -288,6 +288,8 @@ int main(int argc, char *argv[]) {
 	}
 
 	openlog(PACKAGE, LOG_PID | LOG_CONS, LOG_DAEMON);
+	if (! foreground)
+		daemonize();
 
 	// create receiving socket
 	server_sockfd = create_recv_sock();
@@ -312,9 +314,6 @@ int main(int argc, char *argv[]) {
 		log_message(LOG_ERR, "cannot malloc() packet buffer");
 		return 1;
 	}
-
-	if (! foreground)
-		daemonize();
 
 	while (! shutdown_flag) {
 		struct timeval tv = {
