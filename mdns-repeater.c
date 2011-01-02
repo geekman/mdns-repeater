@@ -324,7 +324,7 @@ int main(int argc, char *argv[]) {
 		FD_ZERO(&sockfd_set);
 		FD_SET(server_sockfd, &sockfd_set);
 		int numfd = select(server_sockfd + 1, &sockfd_set, NULL, NULL, &tv);
-		if (numfd == 0)
+		if (numfd <= 0)
 			continue;
 
 		if (FD_ISSET(server_sockfd, &sockfd_set)) {
@@ -384,6 +384,8 @@ int main(int argc, char *argv[]) {
 
 	for (i = 0; i < num_socks; i++) 
 		close(socks[i].sockfd);
+
+	log_message(LOG_INFO, "exit.");
 
 	return 0;
 }
