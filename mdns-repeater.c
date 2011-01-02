@@ -231,13 +231,15 @@ static void daemonize() {
 	umask(0027);
 	chdir("/");
 
-	int i = getdtablesize();
-	while (i--)
+	// close all std fd and reopen /dev/null for them
+	int i;
+	for (i = 0; i < 3; i++) {
 		close(i);
-
-	i = open("/dev/null", O_RDWR);
-	dup(i);
-	dup(i);
+		if (open("/dev/null", O_RDWR) != i) {
+			log_message(LOG_ERR, "unable to open /dev/null for fd %d", i);
+			exit(1);
+		}
+	}
 }
 
 static void show_help(const char *progname) {
