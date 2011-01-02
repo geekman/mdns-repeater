@@ -1,5 +1,7 @@
 # Makefile for mdns-repeater
 
+HGVERSION=$(shell hg id -i)
+
 CFLAGS=-Wall
 
 ifdef DEBUG
@@ -8,6 +10,8 @@ else
 CFLAGS+= -Os
 LDFLAGS+= -s
 endif
+
+CFLAGS+= -DHGVERSION="\"${HGVERSION}\""
 
 .PHONY: all clean
 
