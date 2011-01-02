@@ -77,7 +77,7 @@ void log_message(int loglevel, char *fmt_str, ...) {
 static int create_recv_sock() {
 	int sd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (sd < 0) {
-		perror("socket()");
+		log_message(LOG_ERR, "recv socket(): %m");
 		return sd;
 	}
 
@@ -85,7 +85,7 @@ static int create_recv_sock() {
 
 	int on = 1;
 	if ((r = setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) < 0) {
-		perror("setsockopt(SO_REUSEADDR)");
+		log_message(LOG_ERR, "recv setsockopt(SO_REUSEADDR): %m");
 		return r;
 	}
 
@@ -96,18 +96,18 @@ static int create_recv_sock() {
 	serveraddr.sin_port = htons(MDNS_PORT);
 	serveraddr.sin_addr.s_addr = htonl(INADDR_ANY);	/* receive multicast */
 	if ((r = bind(sd, (struct sockaddr *)&serveraddr, sizeof(serveraddr))) < 0) {
-		perror("bind()");
+		log_message(LOG_ERR, "recv bind(): %m");
 	}
 
 	// enable loopback in case someone else needs the data
 	if ((r = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_LOOP, &on, sizeof(on))) < 0) {
-		perror("setsockopt(IP_MULTICAST_LOOP)");
+		log_message(LOG_ERR, "recv setsockopt(IP_MULTICAST_LOOP): %m");
 		return r;
 	}
 
 #ifdef IP_PKTINFO
 	if ((r = setsockopt(sd, SOL_IP, IP_PKTINFO, &on, sizeof(on))) < 0) {
-		perror("setsockopt(IP_PKTINFO)");
+		log_message(LOG_ERR, "recv setsockopt(IP_PKTINFO): %m");
 		return r;
 	}
 #endif
@@ -118,7 +118,7 @@ static int create_recv_sock() {
 static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock *sockdata) {
 	int sd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (sd < 0) {
-		perror("socket()");
+		log_message(LOG_ERR, "send socket(): %m");
 		return sd;
 	}
 
@@ -134,7 +134,7 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 
 #ifdef SO_BINDTODEVICE
 	if ((r = setsockopt(sd, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(struct ifreq))) < 0) {
-		perror("setsockopt(SO_BINDTODEVICE)");
+		log_message(LOG_ERR, "send setsockopt(SO_BINDTODEVICE): %m");
 		return r;
 	}
 #endif
@@ -154,7 +154,7 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 
 	int on = 1;
 	if ((r = setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) < 0) {
-		perror("setsockopt(SO_REUSEADDR)");
+		log_message(LOG_ERR, "send setsockopt(SO_REUSEADDR): %m");
 		return r;
 	}
 
@@ -165,7 +165,7 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 	serveraddr.sin_port = htons(MDNS_PORT);
 	serveraddr.sin_addr.s_addr = if_addr->s_addr;
 	if ((r = bind(sd, (struct sockaddr *)&serveraddr, sizeof(serveraddr))) < 0) {
-		perror("bind()");
+		log_message(LOG_ERR, "send bind(): %m");
 	}
 
 	// add membership to receiving socket
@@ -174,13 +174,13 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 	mreq.imr_interface.s_addr = if_addr->s_addr;
 	mreq.imr_multiaddr.s_addr = inet_addr(MDNS_ADDR);
 	if ((r = setsockopt(recv_sockfd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq))) < 0) {
-		perror("setsockopt(IP_ADD_MEMBERSHIP)");
+		log_message(LOG_ERR, "recv setsockopt(IP_ADD_MEMBERSHIP): %m");
 		return r;
 	}
 
 	// enable loopback in case someone else needs the data
 	if ((r = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_LOOP, &on, sizeof(on))) < 0) {
-		perror("setsockopt(IP_MULTICAST_LOOP)");
+		log_message(LOG_ERR, "send setsockopt(IP_MULTICAST_LOOP): %m");
 		return r;
 	}
 
@@ -214,7 +214,7 @@ static void mdns_repeater_shutdown(int sig) {
 static void daemonize() {
 	pid_t pid = fork();
 	if (pid < 0) {
-		perror("fork()");
+		log_message(LOG_ERR, "fork(): %m");
 		exit(1);
 	}
 
@@ -313,7 +313,7 @@ int main(int argc, char *argv[]) {
 
 	pkt_data = malloc(PACKET_SIZE);
 	if (pkt_data == NULL) {
-		log_message(LOG_ERR, "cannot malloc() packet buffer");
+		log_message(LOG_ERR, "cannot malloc() packet buffer: %m");
 		return 1;
 	}
 
@@ -336,7 +336,7 @@ int main(int argc, char *argv[]) {
 			ssize_t recvsize = recvfrom(server_sockfd, pkt_data, PACKET_SIZE, 0, 
 				(struct sockaddr *) &fromaddr, &sockaddr_size);
 			if (recvsize < 0) {
-				perror("recv()");
+				log_message(LOG_ERR, "recv(): %m");
 			}
 
 			int j;
@@ -367,7 +367,7 @@ int main(int argc, char *argv[]) {
 				ssize_t sentsize = send_packet(socks[j].sockfd, pkt_data, (size_t) recvsize);
 				if (sentsize != recvsize) {
 					if (sentsize < 0)
-						perror("send()");
+						log_message(LOG_ERR, "send()");
 					else
 						log_message(LOG_ERR, "send_packet size differs: sent=%ld actual=%ld",
 							recvsize, sentsize);
