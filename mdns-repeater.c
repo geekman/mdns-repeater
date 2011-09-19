@@ -264,6 +264,12 @@ static int parse_opts(int argc, char *argv[]) {
 		switch (c) {
 			case 'h': help = 1; break;
 			case 'f': foreground = 1; break;
+
+			case '?':
+			case ':':
+				fputs("\n", stderr);
+				break;
+
 			default:
 				fprintf(stderr, "unknown option %c\n", optopt);
 				exit(2);
