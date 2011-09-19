@@ -314,7 +314,7 @@ static int parse_opts(int argc, char *argv[]) {
 			case 'f': foreground = 1; break;
 			case 'p':
 				if (optarg[0] != '/')
-					fprintf(stderr, "pid file path must be absolute\n");
+					log_message(LOG_ERR, "pid file path must be absolute");
 				else
 					pid_file = optarg;
 				break;
@@ -325,7 +325,7 @@ static int parse_opts(int argc, char *argv[]) {
 				break;
 
 			default:
-				fprintf(stderr, "unknown option %c\n", optopt);
+				log_message(LOG_ERR, "unknown option %c", optopt);
 				exit(2);
 		}
 	}
@@ -347,7 +347,7 @@ int main(int argc, char *argv[]) {
 
 	if ((argc - optind) <= 1) {
 		show_help(argv[0]);
-		fprintf(stderr, "error: at least 2 interfaces must be specified\n");
+		log_message(LOG_ERR, "error: at least 2 interfaces must be specified");
 		exit(2);
 	}
 
@@ -358,7 +358,7 @@ int main(int argc, char *argv[]) {
 		// check for pid file when running in foreground
 		running_pid = already_running();
 		if (running_pid != -1) {
-			fprintf(stderr, "already running as pid %d", running_pid);
+			log_message(LOG_ERR, "already running as pid %d", running_pid);
 			exit(1);
 		}
 	}
