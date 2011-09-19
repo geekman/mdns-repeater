@@ -37,6 +37,7 @@
 #define MDNS_ADDR "224.0.0.251"
 #define MDNS_PORT 5353
 
+#define PIDFILE "/var/run/" PACKAGE ".pid"
 
 struct if_sock {
 	const char *ifname;		/* interface name  */
@@ -57,6 +58,7 @@ void *pkt_data = NULL;
 int foreground = 0;
 int shutdown_flag = 0;
 
+char *pid_file = PIDFILE;
 
 void log_message(int loglevel, char *fmt_str, ...) {
 	va_list ap;
@@ -211,7 +213,41 @@ static void mdns_repeater_shutdown(int sig) {
 	shutdown_flag = 1;
 }
 
+static pid_t already_running() {
+	FILE *f;
+	int count;
+	pid_t pid;
+   
+	f = fopen(pid_file, "r");
+	if (f != NULL) {
+		count = fscanf(f, "%d", &pid);
+		fclose(f);
+		if (count == 1) {
+			// see if pid exists (works on daemonized instances only)
+			if (getsid(pid) > 0)
+				return pid;
+		}
+	}
+
+	return -1;
+}
+
+static int write_pidfile() {
+	FILE *f;
+	int r;
+
+	f = fopen(pid_file, "w");
+	if (f != NULL) {
+		r = fprintf(f, "%d", getpid());
+		fclose(f);
+		return (r > 0);
+	}
+
+	return 0;
+}
+
 static void daemonize() {
+	pid_t running_pid;
 	pid_t pid = fork();
 	if (pid < 0) {
 		log_message(LOG_ERR, "fork(): %m");
@@ -240,6 +276,16 @@ static void daemonize() {
 			exit(1);
 		}
 	}
+
+	// check for pid file
+	running_pid = already_running();
+	if (running_pid != -1) {
+		log_message(LOG_ERR, "already running as pid %d", running_pid);
+		exit(1);
+	} else if (! write_pidfile()) {
+		log_message(LOG_ERR, "unable to write pid file %s", pid_file);
+		exit(1);
+	}
 }
 
 static void show_help(const char *progname) {
@@ -252,6 +298,7 @@ static void show_help(const char *progname) {
 					"\n"
 					" flags:\n"
 					"	-f	runs in foreground for debugging\n"
+					"	-p	specifies the pid file path (default: " PIDFILE ")\n"
 					"	-h	shows this help\n"
 					"\n"
 		);
@@ -260,10 +307,16 @@ static void show_help(const char *progname) {
 static int parse_opts(int argc, char *argv[]) {
 	int c;
 	int help = 0;
-	while ((c = getopt(argc, argv, "hf")) != -1) {
+	while ((c = getopt(argc, argv, "hfp:")) != -1) {
 		switch (c) {
 			case 'h': help = 1; break;
 			case 'f': foreground = 1; break;
+			case 'p':
+				if (optarg[0] != '/')
+					fprintf(stderr, "pid file path must be absolute\n");
+				else
+					pid_file = optarg;
+				break;
 
 			case '?':
 			case ':':
@@ -285,7 +338,9 @@ static int parse_opts(int argc, char *argv[]) {
 }
 
 int main(int argc, char *argv[]) {
+	pid_t running_pid;
 	fd_set sockfd_set;
+	int r = 0;
 
 	parse_opts(argc, argv);
 
@@ -298,12 +353,21 @@ int main(int argc, char *argv[]) {
 	openlog(PACKAGE, LOG_PID | LOG_CONS, LOG_DAEMON);
 	if (! foreground)
 		daemonize();
+	else {
+		// check for pid file when running in foreground
+		running_pid = already_running();
+		if (running_pid != -1) {
+			fprintf(stderr, "already running as pid %d", running_pid);
+			exit(1);
+		}
+	}
 
 	// create receiving socket
 	server_sockfd = create_recv_sock();
 	if (server_sockfd < 0) {
 		log_message(LOG_ERR, "unable to create server socket");
-		return 1;
+		r = 1;
+		goto end_main;
 	}
 
 	// create sending sockets
@@ -312,7 +376,8 @@ int main(int argc, char *argv[]) {
 		int sockfd = create_send_sock(server_sockfd, argv[i], &socks[num_socks]);
 		if (sockfd < 0) {
 			log_message(LOG_ERR, "unable to create socket for interface %s", argv[i]);
-			return 1;
+			r = 1;
+			goto end_main;
 		}
 		num_socks++;
 	}
@@ -320,7 +385,8 @@ int main(int argc, char *argv[]) {
 	pkt_data = malloc(PACKET_SIZE);
 	if (pkt_data == NULL) {
 		log_message(LOG_ERR, "cannot malloc() packet buffer: %m");
-		return 1;
+		r = 1;
+		goto end_main;
 	}
 
 	while (! shutdown_flag) {
@@ -384,6 +450,8 @@ int main(int argc, char *argv[]) {
 
 	log_message(LOG_INFO, "shutting down...");
 
+end_main:
+
 	if (pkt_data != NULL) 
 		free(pkt_data);
 
@@ -393,7 +461,11 @@ int main(int argc, char *argv[]) {
 	for (i = 0; i < num_socks; i++) 
 		close(socks[i].sockfd);
 
+	// remove pid file if it belongs to us
+	if (already_running() == getpid())
+		unlink(pid_file);
+
 	log_message(LOG_INFO, "exit.");
 
-	return 0;
+	return r;
 }
