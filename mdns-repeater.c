@@ -223,8 +223,7 @@ static pid_t already_running() {
 		count = fscanf(f, "%d", &pid);
 		fclose(f);
 		if (count == 1) {
-			// see if pid exists (works on daemonized instances only)
-			if (getsid(pid) > 0)
+			if (kill(pid, 0) == 0)
 				return pid;
 		}
 	}
