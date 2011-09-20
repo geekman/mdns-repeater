@@ -1,5 +1,6 @@
 syntax: glob
 
 *.o
+_hgversion
 mdns-repeater
  

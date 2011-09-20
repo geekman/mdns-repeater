@@ -289,7 +289,7 @@ static void daemonize() {
 }
 
 static void show_help(const char *progname) {
-	fprintf(stderr, "mDNS repeater (rev " HGVERSION ")\n");
+	fprintf(stderr, "mDNS repeater (version " HGVERSION ")\n");
 	fprintf(stderr, "usage: %s [ -f ] <ifdev> ...\n", progname);
 	fprintf(stderr, "\n"
 					"<ifdev> specifies an interface like \"eth0\"\n"
