@@ -31,7 +31,7 @@ long as you abide by the software license.
 
 LICENSE
 --------
-Copyright (C) 2010 Darell Tan
+Copyright (C) 2011 Darell Tan
 
 This program is free software; you can redistribute it and/or
 modify it under the terms of the GNU General Public License
