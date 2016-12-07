@@ -1,17 +1,17 @@
 /*
  * mdns-repeater.c - mDNS repeater daemon
  * Copyright (C) 2011 Darell Tan
- * 
+ *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
  * as published by the Free Software Foundation; either version 2
  * of the License, or (at your option) any later version.
- * 
+ *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
- * 
+ *
  * You should have received a copy of the GNU General Public License
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
@@ -39,6 +39,9 @@
 
 #define PIDFILE "/var/run/" PACKAGE ".pid"
 
+#define MAX_SOCKS 16
+#define MAX_SUBNETS 16
+
 struct if_sock {
 	const char *ifname;		/* interface name  */
 	int sockfd;				/* socket filedesc */
@@ -47,10 +50,19 @@ struct if_sock {
 	struct in_addr net;		/* interface network (computed) */
 };
 
+struct subnet {
+	struct in_addr addr;    /* subnet addr */
+	struct in_addr mask;    /* subnet mask */
+	struct in_addr net;     /* subnet net (computed) */
+};
+
 int server_sockfd = -1;
 
 int num_socks = 0;
-struct if_sock socks[5];
+struct if_sock socks[MAX_SOCKS];
+
+int num_subnets = 0;
+struct subnet subnets[MAX_SUBNETS];
 
 #define PACKET_SIZE 65536
 void *pkt_data = NULL;
@@ -217,7 +229,7 @@ static pid_t already_running() {
 	FILE *f;
 	int count;
 	pid_t pid;
-   
+
 	f = fopen(pid_file, "r");
 	if (f != NULL) {
 		count = fscanf(f, "%d", &pid);
@@ -299,6 +311,7 @@ static void show_help(const char *progname) {
 					"\n"
 					" flags:\n"
 					"	-f	runs in foreground for debugging\n"
+					"	-b	blacklist subnet (eg. 192.168.1.1/24)\n"
 					"	-p	specifies the pid file path (default: " PIDFILE ")\n"
 					"	-h	shows this help\n"
 					"\n"
@@ -306,9 +319,9 @@ static void show_help(const char *progname) {
 }
 
 static int parse_opts(int argc, char *argv[]) {
-	int c;
+	int c, delim, end;
 	int help = 0;
-	while ((c = getopt(argc, argv, "hfp:")) != -1) {
+	while ((c = getopt(argc, argv, "hfp:b:")) != -1) {
 		switch (c) {
 			case 'h': help = 1; break;
 			case 'f': foreground = 1; break;
@@ -319,6 +332,57 @@ static int parse_opts(int argc, char *argv[]) {
 					pid_file = optarg;
 				break;
 
+			case 'b':
+				if (num_subnets >= MAX_SUBNETS) {
+					log_message(LOG_ERR, "too many blacklisted subnets (maximum is %d)", MAX_SUBNETS);
+					exit(2);
+				}
+
+				delim = 0;
+				end = 0;
+				while (optarg[end] != 0) {
+					if (optarg[end] == '/')
+						delim = end;
+					end++;
+				}
+
+				if (end == 0 || delim == 0 || end == delim) {
+					log_message(LOG_ERR, "invalid blacklist argument");
+					exit(2);
+				}
+
+				struct subnet *ss = &subnets[num_subnets++];
+				char *addr = (char*) malloc(end);
+
+				// Copy the subnet identifier out and parse
+				memset(addr, 0, end);
+				strncpy(addr, optarg, delim);
+				if (inet_pton(AF_INET, addr, &ss->addr) != 1) {
+					log_message(LOG_ERR, "could not parse netmask");
+					exit(2);
+				}
+
+				// Copy the mask out and parse
+				memset(addr, 0, end);
+				strncpy(addr, optarg+delim+1, end-delim-1);
+				int mask = atoi(addr);
+				free(addr);
+
+				if (mask < 0 || mask > 32) {
+					log_message(LOG_ERR, "invalid netmask");
+					exit(2);
+				}
+
+				ss->mask.s_addr = ntohl((uint32_t)0xFFFFFFFF << (32 - mask));
+				ss->net.s_addr = ss->addr.s_addr & ss->mask.s_addr;
+				char *addr_str = strdup(inet_ntoa(ss->addr));
+				char *mask_str = strdup(inet_ntoa(ss->mask));
+				char *net_str  = strdup(inet_ntoa(ss->net));
+				log_message(LOG_INFO, "blacklist addr %s mask %s net %s", addr_str, mask_str, net_str);
+				free(addr_str);
+				free(mask_str);
+				free(net_str);
+				break;
 			case '?':
 			case ':':
 				fputs("\n", stderr);
@@ -374,6 +438,11 @@ int main(int argc, char *argv[]) {
 	// create sending sockets
 	int i;
 	for (i = optind; i < argc; i++) {
+		if (num_socks >= MAX_SOCKS) {
+			log_message(LOG_ERR, "too many sockets (maximum is %d)", MAX_SOCKS);
+			exit(2);
+		}
+
 		int sockfd = create_send_sock(server_sockfd, argv[i], &socks[num_socks]);
 		if (sockfd < 0) {
 			log_message(LOG_ERR, "unable to create socket for interface %s", argv[i]);
@@ -406,7 +475,7 @@ int main(int argc, char *argv[]) {
 			struct sockaddr_in fromaddr;
 			socklen_t sockaddr_size = sizeof(struct sockaddr_in);
 
-			ssize_t recvsize = recvfrom(server_sockfd, pkt_data, PACKET_SIZE, 0, 
+			ssize_t recvsize = recvfrom(server_sockfd, pkt_data, PACKET_SIZE, 0,
 				(struct sockaddr *) &fromaddr, &sockaddr_size);
 			if (recvsize < 0) {
 				log_message(LOG_ERR, "recv(): %m");
@@ -424,6 +493,21 @@ int main(int argc, char *argv[]) {
 
 			if (self_generated_packet)
 				continue;
+
+			char blacklisted_packet = 0;
+			for (j = 0; j < num_subnets; j++) {
+				// check for blacklist
+				if ((fromaddr.sin_addr.s_addr & subnets[j].mask.s_addr) == subnets[j].net.s_addr) {
+					blacklisted_packet = 1;
+					break;
+				}
+			}
+
+			if (blacklisted_packet) {
+				if (foreground)
+					printf("skipping packet from=%s\n", inet_ntoa(fromaddr.sin_addr));
+				continue;
+			}
 
 			if (foreground)
 				printf("data from=%s size=%ld\n", inet_ntoa(fromaddr.sin_addr), recvsize);
@@ -453,13 +537,13 @@ int main(int argc, char *argv[]) {
 
 end_main:
 
-	if (pkt_data != NULL) 
+	if (pkt_data != NULL)
 		free(pkt_data);
 
 	if (server_sockfd >= 0)
 		close(server_sockfd);
 
-	for (i = 0; i < num_socks; i++) 
+	for (i = 0; i < num_socks; i++)
 		close(socks[i].sockfd);
 
 	// remove pid file if it belongs to us
