@@ -61,8 +61,11 @@ int server_sockfd = -1;
 int num_socks = 0;
 struct if_sock socks[MAX_SOCKS];
 
-int num_subnets = 0;
-struct subnet subnets[MAX_SUBNETS];
+int num_blacklisted_subnets = 0;
+struct subnet blacklisted_subnets[MAX_SUBNETS];
+
+int num_whitelisted_subnets = 0;
+struct subnet whitelisted_subnets[MAX_SUBNETS];
 
 #define PACKET_SIZE 65536
 void *pkt_data = NULL;
@@ -312,16 +315,69 @@ static void show_help(const char *progname) {
 					" flags:\n"
 					"	-f	runs in foreground for debugging\n"
 					"	-b	blacklist subnet (eg. 192.168.1.1/24)\n"
+					"	-w	whitelist subnet (eg. 192.168.1.1/24)\n"
 					"	-p	specifies the pid file path (default: " PIDFILE ")\n"
 					"	-h	shows this help\n"
 					"\n"
 		);
 }
 
+int parse(char *input, struct subnet *s) {
+	int delim = 0;
+	int end = 0;
+	while (input[end] != 0) {
+		if (input[end] == '/') {
+			delim = end;
+		}
+		end++;
+	}
+
+	if (end == 0 || delim == 0 || end == delim) {
+		return -1;
+	}
+
+	char *addr = (char*) malloc(end);
+
+	memset(addr, 0, end);
+	strncpy(addr, input, delim);
+	if (inet_pton(AF_INET, addr, &s->addr) != 1) {
+		free(addr);
+		return -2;
+	}
+
+	memset(addr, 0, end);
+	strncpy(addr, input+delim+1, end-delim-1);
+	int mask = atoi(addr);
+	free(addr);
+
+	if (mask < 0 || mask > 32) {
+		return -3;
+	}
+
+	s->mask.s_addr = ntohl((uint32_t)0xFFFFFFFF << (32 - mask));
+	s->net.s_addr = s->addr.s_addr & s->mask.s_addr;
+
+	return 0;
+}
+
+int tostring(struct subnet *s, char* buf, int len) {
+	char *addr_str = strdup(inet_ntoa(s->addr));
+	char *mask_str = strdup(inet_ntoa(s->mask));
+	char *net_str = strdup(inet_ntoa(s->net));
+	int l = snprintf(buf, len, "addr %s mask %s net %s", addr_str, mask_str, net_str);
+	free(addr_str);
+	free(mask_str);
+	free(net_str);
+
+	return l;
+}
+
 static int parse_opts(int argc, char *argv[]) {
-	int c, delim, end;
+	int c, res;
 	int help = 0;
-	while ((c = getopt(argc, argv, "hfp:b:")) != -1) {
+	struct subnet *ss;
+	char *msg;
+	while ((c = getopt(argc, argv, "hfp:b:w:")) != -1) {
 		switch (c) {
 			case 'h': help = 1; break;
 			case 'f': foreground = 1; break;
@@ -333,55 +389,70 @@ static int parse_opts(int argc, char *argv[]) {
 				break;
 
 			case 'b':
-				if (num_subnets >= MAX_SUBNETS) {
+				if (num_blacklisted_subnets >= MAX_SUBNETS) {
 					log_message(LOG_ERR, "too many blacklisted subnets (maximum is %d)", MAX_SUBNETS);
 					exit(2);
 				}
 
-				delim = 0;
-				end = 0;
-				while (optarg[end] != 0) {
-					if (optarg[end] == '/')
-						delim = end;
-					end++;
-				}
-
-				if (end == 0 || delim == 0 || end == delim) {
-					log_message(LOG_ERR, "invalid blacklist argument");
+				if (num_whitelisted_subnets != 0) {
+					log_message(LOG_ERR, "simultaneous whitelisting and blacklisting does not make sense");
 					exit(2);
 				}
 
-				struct subnet *ss = &subnets[num_subnets++];
-				char *addr = (char*) malloc(end);
+				ss = &blacklisted_subnets[num_blacklisted_subnets];
+				res = parse(optarg, ss);
+				switch (res) {
+					case -1:
+						log_message(LOG_ERR, "invalid blacklist argument");
+						exit(2);
+					case -2:
+						log_message(LOG_ERR, "could not parse netmask");
+						exit(2);
+					case -3:
+						log_message(LOG_ERR, "invalid netmask");
+						exit(2);
+				}
 
-				// Copy the subnet identifier out and parse
-				memset(addr, 0, end);
-				strncpy(addr, optarg, delim);
-				if (inet_pton(AF_INET, addr, &ss->addr) != 1) {
-					log_message(LOG_ERR, "could not parse netmask");
+				num_blacklisted_subnets++;
+
+				msg = malloc(128);
+				memset(msg, 0, 128);
+				tostring(ss, msg, 128);
+				log_message(LOG_INFO, "blacklist %s", msg);
+				free(msg);
+				break;
+			case 'w':
+				if (num_whitelisted_subnets >= MAX_SUBNETS) {
+					log_message(LOG_ERR, "too many whitelisted subnets (maximum is %d)", MAX_SUBNETS);
 					exit(2);
 				}
 
-				// Copy the mask out and parse
-				memset(addr, 0, end);
-				strncpy(addr, optarg+delim+1, end-delim-1);
-				int mask = atoi(addr);
-				free(addr);
-
-				if (mask < 0 || mask > 32) {
-					log_message(LOG_ERR, "invalid netmask");
+				if (num_blacklisted_subnets != 0) {
+					log_message(LOG_ERR, "simultaneous whitelisting and blacklisting does not make sense");
 					exit(2);
 				}
 
-				ss->mask.s_addr = ntohl((uint32_t)0xFFFFFFFF << (32 - mask));
-				ss->net.s_addr = ss->addr.s_addr & ss->mask.s_addr;
-				char *addr_str = strdup(inet_ntoa(ss->addr));
-				char *mask_str = strdup(inet_ntoa(ss->mask));
-				char *net_str  = strdup(inet_ntoa(ss->net));
-				log_message(LOG_INFO, "blacklist addr %s mask %s net %s", addr_str, mask_str, net_str);
-				free(addr_str);
-				free(mask_str);
-				free(net_str);
+				ss = &whitelisted_subnets[num_whitelisted_subnets];
+				res = parse(optarg, ss);
+				switch (res) {
+					case -1:
+						log_message(LOG_ERR, "invalid whitelist argument");
+						exit(2);
+					case -2:
+						log_message(LOG_ERR, "could not parse netmask");
+						exit(2);
+					case -3:
+						log_message(LOG_ERR, "invalid netmask");
+						exit(2);
+				}
+
+				num_whitelisted_subnets++;
+
+				msg = malloc(128);
+				memset(msg, 0, 128);
+				tostring(ss, msg, 128);
+				log_message(LOG_INFO, "whitelist %s", msg);
+				free(msg);
 				break;
 			case '?':
 			case ':':
@@ -494,23 +565,40 @@ int main(int argc, char *argv[]) {
 			if (self_generated_packet)
 				continue;
 
-			char blacklisted_packet = 0;
-			for (j = 0; j < num_subnets; j++) {
-				// check for blacklist
-				if ((fromaddr.sin_addr.s_addr & subnets[j].mask.s_addr) == subnets[j].net.s_addr) {
-					blacklisted_packet = 1;
-					break;
+			if (num_whitelisted_subnets != 0) {
+				char whitelisted_packet = 0;
+				for (j = 0; j < num_whitelisted_subnets; j++) {
+					// check for whitelist
+					if ((fromaddr.sin_addr.s_addr & whitelisted_subnets[j].mask.s_addr) == whitelisted_subnets[j].net.s_addr) {
+						whitelisted_packet = 1;
+						break;
+					}
+				}
+
+				if (!whitelisted_packet) {
+					if (foreground)
+						printf("skipping packet from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
+					continue;
+				}
+			} else {
+				char blacklisted_packet = 0;
+				for (j = 0; j < num_blacklisted_subnets; j++) {
+					// check for blacklist
+					if ((fromaddr.sin_addr.s_addr & blacklisted_subnets[j].mask.s_addr) == blacklisted_subnets[j].net.s_addr) {
+						blacklisted_packet = 1;
+						break;
+					}
+				}
+
+				if (blacklisted_packet) {
+					if (foreground)
+						printf("skipping packet from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
+					continue;
 				}
 			}
 
-			if (blacklisted_packet) {
-				if (foreground)
-					printf("skipping packet from=%s\n", inet_ntoa(fromaddr.sin_addr));
-				continue;
-			}
-
 			if (foreground)
-				printf("data from=%s size=%ld\n", inet_ntoa(fromaddr.sin_addr), recvsize);
+				printf("data from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
 
 			for (j = 0; j < num_socks; j++) {
 				// do not repeat packet back to the same network from which it originated
@@ -526,7 +614,7 @@ int main(int argc, char *argv[]) {
 					if (sentsize < 0)
 						log_message(LOG_ERR, "send()");
 					else
-						log_message(LOG_ERR, "send_packet size differs: sent=%ld actual=%ld",
+						log_message(LOG_ERR, "send_packet size differs: sent=%zd actual=%zd",
 							recvsize, sentsize);
 				}
 			}
