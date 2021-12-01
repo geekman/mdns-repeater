@@ -210,6 +210,12 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 		return r;
 	}
 
+    int ttl = 255; // IP TTL should be 255: https://datatracker.ietf.org/doc/html/rfc6762#section-11
+    if ((r = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl))) < 0) {
+        log_message(LOG_ERR, "send setsockopt(IP_MULTICAST_TTL): %s", strerror(errno));
+        return r;
+    }
+
 	char *addr_str = strdup(inet_ntoa(sockdata->addr));
 	char *mask_str = strdup(inet_ntoa(sockdata->mask));
 	char *net_str  = strdup(inet_ntoa(sockdata->net));
