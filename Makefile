@@ -11,12 +11,26 @@ HGVERSION=$(shell git rev-parse HEAD )
 
 CFLAGS=-Wall
 
-ifdef DEBUG
-CFLAGS+= -g
+ifeq ($(OS),Windows_NT) 
+    detected_OS := Windows
 else
-CFLAGS+= -Os
-LDFLAGS+= -s
+    detected_OS := $(shell sh -c 'uname 2>/dev/null || echo Unknown')
 endif
+
+ifdef DEBUG
+	CFLAGS+= -g
+else
+	CFLAGS+= -Os
+	
+	ifneq ($(detected_OS), Darwin)
+		LDFLAGS+= -s
+	endif
+endif
+
+ifeq ($(detected_OS), Darwin)
+	CFLAGS+= -DSOL_IP=IPPROTO_IP
+endif	
+
 
 CFLAGS+= -DHGVERSION="\"${HGVERSION}\""
 
