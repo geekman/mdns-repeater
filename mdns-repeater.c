@@ -29,6 +29,7 @@
 #include <stdarg.h>
 #include <syslog.h>
 #include <unistd.h>
+#include <pwd.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <net/if.h>
@@ -333,6 +334,7 @@ static void show_help(const char *progname) {
 					"	-b	blacklist subnet (eg. 192.168.1.1/24)\n"
 					"	-w	whitelist subnet (eg. 192.168.1.1/24)\n"
 					"	-p	specifies the pid file path (default: " PIDFILE ")\n"
+					"	-u	run as this user (by name)\n"
 					"	-h	shows this help\n"
 					"\n"
 		);
@@ -393,7 +395,7 @@ static int parse_opts(int argc, char *argv[]) {
 	int help = 0;
 	struct subnet *ss;
 	char *msg;
-	while ((c = getopt(argc, argv, "hfp:b:w:")) != -1) {
+	while ((c = getopt(argc, argv, "hfp:b:w:u:")) != -1) {
 		switch (c) {
 			case 'h': help = 1; break;
 			case 'f': foreground = 1; break;
@@ -474,6 +476,23 @@ static int parse_opts(int argc, char *argv[]) {
 			case ':':
 				fputs("\n", stderr);
 				break;
+
+			case 'u': {
+				const struct passwd* user;
+				if ((user = getpwnam(optarg)) == NULL) {
+					log_message(LOG_ERR, "No such user '%s'", optarg);
+					exit(2);
+				}
+				errno = 0;
+				if (setgid(user->pw_gid) != 0) {
+					log_message(LOG_ERR, "Failed to switch to group %d - %s", user->pw_gid, strerror(errno));
+					exit(2);
+				} else if (setuid(user->pw_uid) != 0) {
+					log_message(LOG_ERR, "Failed to switch to user %s (%d) - %s", user->pw_name, user->pw_uid, strerror(errno));
+					exit(2);
+				}
+				break;
+			}
 
 			default:
 				log_message(LOG_ERR, "unknown option %c", optopt);
