@@ -296,7 +296,10 @@ static void daemonize() {
 
 	setsid();
 	umask(0027);
-	chdir("/");
+	if (chdir("/") < 0) {
+		log_message(LOG_ERR, "unable to change to root directory");
+		exit(1);
+	}
 
 	// close all std fd and reopen /dev/null for them
 	int i;
