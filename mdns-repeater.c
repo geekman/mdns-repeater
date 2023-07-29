@@ -79,6 +79,8 @@ int shutdown_flag = 0;
 
 char *pid_file = PIDFILE;
 
+const struct passwd* user = NULL;
+
 void log_message(int loglevel, char *fmt_str, ...) {
 	va_list ap;
 	char buf[2048];
@@ -319,6 +321,17 @@ static void daemonize() {
 	}
 }
 
+static void switch_user() {
+	errno = 0;
+	if (setgid(user->pw_gid) != 0) {
+		log_message(LOG_ERR, "Failed to switch to group %d - %s", user->pw_gid, strerror(errno));
+		exit(2);
+	} else if (setuid(user->pw_uid) != 0) {
+		log_message(LOG_ERR, "Failed to switch to user %s (%d) - %s", user->pw_name, user->pw_uid, strerror(errno));
+		exit(2);
+	}
+}
+
 static void show_help(const char *progname) {
 	fprintf(stderr, "mDNS repeater (version " HGVERSION ")\n");
 	fprintf(stderr, "Copyright (C) 2011 Darell Tan\n\n");
@@ -478,17 +491,8 @@ static int parse_opts(int argc, char *argv[]) {
 				break;
 
 			case 'u': {
-				const struct passwd* user;
 				if ((user = getpwnam(optarg)) == NULL) {
 					log_message(LOG_ERR, "No such user '%s'", optarg);
-					exit(2);
-				}
-				errno = 0;
-				if (setgid(user->pw_gid) != 0) {
-					log_message(LOG_ERR, "Failed to switch to group %d - %s", user->pw_gid, strerror(errno));
-					exit(2);
-				} else if (setuid(user->pw_uid) != 0) {
-					log_message(LOG_ERR, "Failed to switch to user %s (%d) - %s", user->pw_name, user->pw_uid, strerror(errno));
 					exit(2);
 				}
 				break;
@@ -522,16 +526,6 @@ int main(int argc, char *argv[]) {
 	}
 
 	openlog(PACKAGE, LOG_PID | LOG_CONS, LOG_DAEMON);
-	if (! foreground)
-		daemonize();
-	else {
-		// check for pid file when running in foreground
-		running_pid = already_running();
-		if (running_pid != -1) {
-			log_message(LOG_ERR, "already running as pid %d", running_pid);
-			exit(1);
-		}
-	}
 
 	// create receiving socket
 	server_sockfd = create_recv_sock();
@@ -556,6 +550,21 @@ int main(int argc, char *argv[]) {
 			goto end_main;
 		}
 		num_socks++;
+	}
+
+	if (user) {
+		switch_user();
+	}
+
+	if (! foreground)
+		daemonize();
+	else {
+		// check for pid file when running in foreground
+		running_pid = already_running();
+		if (running_pid != -1) {
+			log_message(LOG_ERR, "already running as pid %d", running_pid);
+			exit(1);
+		}
 	}
 
 	pkt_data = malloc(PACKET_SIZE);
