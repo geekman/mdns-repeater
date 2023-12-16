@@ -600,16 +600,22 @@ int main(int argc, char *argv[]) {
 			}
 
 			int j;
-			char self_generated_packet = 0;
+			char discard = 0;
+			char our_net = 0;
 			for (j = 0; j < num_socks; j++) {
+				// make sure packet originated from specified networks
+				if ((fromaddr.sin_addr.s_addr & socks[j].mask.s_addr) == socks[j].net.s_addr) {
+					our_net = 1;
+				}
+
 				// check for loopback
 				if (fromaddr.sin_addr.s_addr == socks[j].addr.s_addr) {
-					self_generated_packet = 1;
+					discard = 1;
 					break;
 				}
 			}
 
-			if (self_generated_packet)
+			if (discard || !our_net)
 				continue;
 
 			if (num_whitelisted_subnets != 0) {
