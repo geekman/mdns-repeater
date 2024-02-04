@@ -46,8 +46,6 @@
 #define PIDFILE "/var/run/" PACKAGE ".pid"
 #endif
 
-#define MAX_SUBNETS 16
-
 struct if_sock {
 	const char *ifname;	/* interface name  */
 	int sockfd;		/* socket filedesc */
@@ -62,15 +60,12 @@ struct subnet {
 	struct in_addr addr;    /* subnet addr */
 	struct in_addr mask;    /* subnet mask */
 	struct in_addr net;     /* subnet net (computed) */
+	struct list_head list;	/* subnet list */
 };
+LIST_HEAD(blacklisted_subnets);
+LIST_HEAD(whitelisted_subnets);
 
 int server_sockfd = -1;
-
-int num_blacklisted_subnets = 0;
-struct subnet blacklisted_subnets[MAX_SUBNETS];
-
-int num_whitelisted_subnets = 0;
-struct subnet whitelisted_subnets[MAX_SUBNETS];
 
 #define PACKET_SIZE 65536
 void *pkt_data = NULL;
@@ -380,12 +375,19 @@ static void show_help(const char *progname) {
 		);
 }
 
-static bool
-parse_subnet(const char *input, struct subnet *s) {
-	bool r = false;
+static struct subnet *
+parse_subnet(const char *input) {
+	struct subnet *subnet;
 	char *addr = NULL;
 	char *delim;
 	int mask;
+
+	subnet = malloc(sizeof(*subnet));
+	if (!subnet) {
+		log_message(LOG_ERR, "malloc(): %s", strerror(errno));
+		goto out;
+	}
+	memset(subnet, 0, sizeof(*subnet));
 
 	addr = strdup(input);
 	if (!addr) {
@@ -400,7 +402,7 @@ parse_subnet(const char *input, struct subnet *s) {
 	}
 	*delim = '\0';
 
-	if (inet_pton(AF_INET, addr, &s->addr) != 1) {
+	if (inet_pton(AF_INET, addr, &subnet->addr) != 1) {
 		log_message(LOG_ERR, "could not parse blacklist/whitelist netmask: %s", input);
 		goto out;
 	}
@@ -411,14 +413,16 @@ parse_subnet(const char *input, struct subnet *s) {
 		log_message(LOG_ERR, "invalid blacklist/whitelist netmask: %s", input);
 		goto out;
 	}
+	free(addr);
 
-	s->mask.s_addr = ntohl((uint32_t)0xFFFFFFFF << (32 - mask));
-	s->net.s_addr = s->addr.s_addr & s->mask.s_addr;
-	r = true;
+	subnet->mask.s_addr = ntohl((uint32_t)0xFFFFFFFF << (32 - mask));
+	subnet->net.s_addr = subnet->addr.s_addr & subnet->mask.s_addr;
+	return subnet;
 
 out:
 	free(addr);
-	return r;
+	free(subnet);
+	return NULL;
 }
 
 int tostring(struct subnet *s, char* buf, int len) {
@@ -436,7 +440,7 @@ int tostring(struct subnet *s, char* buf, int len) {
 static int parse_opts(int argc, char *argv[]) {
 	int c;
 	bool help = false;
-	struct subnet *ss;
+	struct subnet *subnet;
 	char *msg;
 
 	while ((c = getopt(argc, argv, "hfp:b:w:u:")) != -1) {
@@ -457,49 +461,31 @@ static int parse_opts(int argc, char *argv[]) {
 				break;
 
 			case 'b':
-				if (num_blacklisted_subnets >= MAX_SUBNETS) {
-					log_message(LOG_ERR, "too many blacklisted subnets (maximum is %d)", MAX_SUBNETS);
+				subnet = parse_subnet(optarg);
+				if (!subnet)
 					exit(2);
-				}
-
-				if (num_whitelisted_subnets != 0) {
-					log_message(LOG_ERR, "simultaneous whitelisting and blacklisting does not make sense");
-					exit(2);
-				}
-
-				ss = &blacklisted_subnets[num_blacklisted_subnets];
-				if (!parse_subnet(optarg, ss))
-					exit(2);
-				num_blacklisted_subnets++;
+				list_add(&subnet->list, &blacklisted_subnets);
 
 				msg = malloc(128);
 				memset(msg, 0, 128);
-				tostring(ss, msg, 128);
+				tostring(subnet, msg, 128);
 				log_message(LOG_INFO, "blacklist %s", msg);
 				free(msg);
 				break;
+
 			case 'w':
-				if (num_whitelisted_subnets >= MAX_SUBNETS) {
-					log_message(LOG_ERR, "too many whitelisted subnets (maximum is %d)", MAX_SUBNETS);
+				subnet = parse_subnet(optarg);
+				if (!subnet)
 					exit(2);
-				}
-
-				if (num_blacklisted_subnets != 0) {
-					log_message(LOG_ERR, "simultaneous whitelisting and blacklisting does not make sense");
-					exit(2);
-				}
-
-				ss = &whitelisted_subnets[num_whitelisted_subnets];
-				if (!parse_subnet(optarg, ss))
-					exit(2);
-				num_whitelisted_subnets++;
+				list_add(&subnet->list, &whitelisted_subnets);
 
 				msg = malloc(128);
 				memset(msg, 0, 128);
-				tostring(ss, msg, 128);
+				tostring(subnet, msg, 128);
 				log_message(LOG_INFO, "whitelist %s", msg);
 				free(msg);
 				break;
+
 			case '?':
 			case ':':
 				fputs("\n", stderr);
@@ -519,6 +505,11 @@ static int parse_opts(int argc, char *argv[]) {
 		}
 	}
 
+	if (!list_empty(&whitelisted_subnets) && !list_empty(&blacklisted_subnets)) {
+		log_message(LOG_ERR, "simultaneous whitelisting and blacklisting does not make sense");
+		exit(2);
+	}
+
 	if (help) {
 		show_help(argv[0]);
 		exit(0);
@@ -532,6 +523,7 @@ int main(int argc, char *argv[]) {
 	fd_set sockfd_set;
 	int r = 0;
 	struct if_sock *sock, *tmp_sock;
+	struct subnet *subnet, *tmp_subnet;
 
 	parse_opts(argc, argv);
 
@@ -626,11 +618,11 @@ int main(int argc, char *argv[]) {
 			if (discard || !our_net)
 				continue;
 
-			if (num_whitelisted_subnets != 0) {
+			if (!list_empty(&whitelisted_subnets)) {
 				bool whitelisted_packet = false;
-				for (int j = 0; j < num_whitelisted_subnets; j++) {
+				list_for_each_entry(subnet, &whitelisted_subnets, list) {
 					// check for whitelist
-					if ((fromaddr.sin_addr.s_addr & whitelisted_subnets[j].mask.s_addr) == whitelisted_subnets[j].net.s_addr) {
+					if ((fromaddr.sin_addr.s_addr & subnet->mask.s_addr) == subnet->net.s_addr) {
 						whitelisted_packet = true;
 						break;
 					}
@@ -643,9 +635,9 @@ int main(int argc, char *argv[]) {
 				}
 			} else {
 				bool blacklisted_packet = false;
-				for (int j = 0; j < num_blacklisted_subnets; j++) {
+				list_for_each_entry(subnet, &blacklisted_subnets, list) {
 					// check for blacklist
-					if ((fromaddr.sin_addr.s_addr & blacklisted_subnets[j].mask.s_addr) == blacklisted_subnets[j].net.s_addr) {
+					if ((fromaddr.sin_addr.s_addr & subnet->mask.s_addr) == subnet->net.s_addr) {
 						blacklisted_packet = true;
 						break;
 					}
@@ -699,6 +691,16 @@ end_main:
 		list_del(&sock->list);
 		close(sock->sockfd);
 		free(sock);
+	}
+
+	list_for_each_entry_safe(subnet, tmp_subnet, &blacklisted_subnets, list) {
+		list_del(&subnet->list);
+		free(subnet);
+	}
+
+	list_for_each_entry_safe(subnet, tmp_subnet, &whitelisted_subnets, list) {
+		list_del(&subnet->list);
+		free(subnet);
 	}
 
 	// remove pid file if it belongs to us
