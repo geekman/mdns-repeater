@@ -35,6 +35,7 @@
 #include <net/if.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <poll.h>
 
 #include "list.h"
 
@@ -534,7 +535,6 @@ static int parse_opts(int argc, char *argv[]) {
 
 int main(int argc, char *argv[]) {
 	pid_t running_pid;
-	fd_set sockfd_set;
 	int r = 0;
 	struct if_sock *sock, *tmp_sock;
 	struct subnet *subnet, *tmp_subnet;
@@ -597,24 +597,26 @@ int main(int argc, char *argv[]) {
 		goto end_main;
 	}
 
+	int pfd_count = 2;
+	struct pollfd pfds[2] = {
+		{
+			.fd = signal_pipe_fds[PIPE_RD],
+			.events = POLLIN,
+		}, {
+			.fd = server_sockfd,
+			.events = POLLIN,
+		}
+	};
+
 	while (true) {
-		struct timeval tv = {
-			.tv_sec = 10,
-			.tv_usec = 0,
-		};
-
-		FD_ZERO(&sockfd_set);
-		FD_SET(server_sockfd, &sockfd_set);
-		FD_SET(signal_pipe_fds[PIPE_RD], &sockfd_set);
-
-		int numfd = select(server_sockfd + 1, &sockfd_set, NULL, NULL, &tv);
-		if (numfd <= 0)
+		r = poll(pfds, pfd_count, -1);
+		if (r <= 0)
 			continue;
 
-		if (FD_ISSET(signal_pipe_fds[PIPE_RD], &sockfd_set))
+		if (pfds[0].revents & POLLIN)
 			break;
 
-		if (FD_ISSET(server_sockfd, &sockfd_set)) {
+		if (pfds[1].revents & POLLIN) {
 			struct sockaddr_in fromaddr;
 			socklen_t sockaddr_size = sizeof(struct sockaddr_in);
 			ssize_t recvsize;
