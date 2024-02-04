@@ -425,6 +425,18 @@ out:
 	return NULL;
 }
 
+static bool
+subnet_match(struct sockaddr_in *fromaddr, struct list_head *subnets)
+{
+	struct subnet *subnet;
+
+	list_for_each_entry(subnet, subnets, list)
+		if ((fromaddr->sin_addr.s_addr & subnet->mask.s_addr) == subnet->net.s_addr)
+			return true;
+
+	return false;
+}
+
 int tostring(struct subnet *s, char* buf, int len) {
 	char *addr_str = strdup(inet_ntoa(s->addr));
 	char *mask_str = strdup(inet_ntoa(s->mask));
@@ -618,36 +630,17 @@ int main(int argc, char *argv[]) {
 			if (discard || !our_net)
 				continue;
 
-			if (!list_empty(&whitelisted_subnets)) {
-				bool whitelisted_packet = false;
-				list_for_each_entry(subnet, &whitelisted_subnets, list) {
-					// check for whitelist
-					if ((fromaddr.sin_addr.s_addr & subnet->mask.s_addr) == subnet->net.s_addr) {
-						whitelisted_packet = true;
-						break;
-					}
-				}
+			if (!list_empty(&whitelisted_subnets) &&
+			    !subnet_match(&fromaddr, &whitelisted_subnets)) {
+				if (foreground)
+					printf("skipping packet from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
+				continue;
+			}
 
-				if (!whitelisted_packet) {
-					if (foreground)
-						printf("skipping packet from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
-					continue;
-				}
-			} else {
-				bool blacklisted_packet = false;
-				list_for_each_entry(subnet, &blacklisted_subnets, list) {
-					// check for blacklist
-					if ((fromaddr.sin_addr.s_addr & subnet->mask.s_addr) == subnet->net.s_addr) {
-						blacklisted_packet = true;
-						break;
-					}
-				}
-
-				if (blacklisted_packet) {
-					if (foreground)
-						printf("skipping packet from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
-					continue;
-				}
+			if (subnet_match(&fromaddr, &blacklisted_subnets)) {
+				if (foreground)
+					printf("skipping packet from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
+				continue;
 			}
 
 			if (foreground)
