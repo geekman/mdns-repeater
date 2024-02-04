@@ -59,10 +59,16 @@ LIST_HEAD(send_socks);
 
 #define PACKET_SIZE 65536
 struct recv_sock {
-	const char *name;		/* name of this socket  */
-	int sockfd;			/* socket fd            */
-	char pkt_data[PACKET_SIZE];	/* incoming packet data */
-	struct list_head list;		/* socket list          */
+	const char *name;			/* name of this socket  */
+	int sockfd;				/* socket fd            */
+	char pkt_data[PACKET_SIZE];		/* incoming packet data */
+	union {
+		struct sockaddr_storage from;	/* sender addr		*/
+		struct sockaddr_in6 from_in6;	/* sender addr (IPv6)	*/
+		struct sockaddr_in from_in;	/* sender addr (IPv4)	*/
+	};
+	char from_str[INET6_ADDRSTRLEN];	/* sender addr (str)	*/
+	struct list_head list;			/* socket list          */
 };
 LIST_HEAD(recv_socks);
 
@@ -644,8 +650,7 @@ int main(int argc, char *argv[]) {
 			break;
 
 		for (int i = 1; i < pfds_used; i++) {
-			struct sockaddr_in fromaddr;
-			socklen_t sockaddr_size = sizeof(struct sockaddr_in);
+			socklen_t sockaddr_size;
 			ssize_t recvsize;
 			bool discard = false;
 			bool our_net = false;
@@ -664,24 +669,45 @@ int main(int argc, char *argv[]) {
 			if (!recv_sock)
 				continue;
 
+			sockaddr_size = sizeof(recv_sock->from);
 			recvsize = recvfrom(recv_sock->sockfd,
 					    recv_sock->pkt_data,
 					    sizeof(recv_sock->pkt_data), 0,
-					    (struct sockaddr *)&fromaddr,
+					    (struct sockaddr *)&recv_sock->from,
 					    &sockaddr_size);
 			if (recvsize < 0) {
 				log_message(LOG_ERR, "recv(): %s", strerror(errno));
 				continue;
 			}
 
+			switch (recv_sock->from.ss_family) {
+			case AF_INET:
+				if (!inet_ntop(AF_INET,
+					       &recv_sock->from_in.sin_addr,
+					       recv_sock->from_str,
+					       sizeof(recv_sock->from_str)))
+					recv_sock->from_str[0] = '\0';
+				break;
+			case AF_INET6:
+				if (!inet_ntop(AF_INET6,
+					       &recv_sock->from_in6.sin6_addr,
+					       recv_sock->from_str,
+					       sizeof(recv_sock->from_str)))
+					recv_sock->from_str[0] = '\0';
+				/* Not supported yet */
+				continue;
+			default:
+				continue;
+			}
+
 			list_for_each_entry(send_sock, &send_socks, list) {
 				// make sure packet originated from specified networks
-				if ((fromaddr.sin_addr.s_addr & send_sock->mask.s_addr) == send_sock->net.s_addr) {
+				if ((recv_sock->from_in.sin_addr.s_addr & send_sock->mask.s_addr) == send_sock->net.s_addr) {
 					our_net = true;
 				}
 
 				// check for loopback
-				if (fromaddr.sin_addr.s_addr == send_sock->addr.s_addr) {
+				if (recv_sock->from_in.sin_addr.s_addr == send_sock->addr.s_addr) {
 					discard = true;
 					break;
 				}
@@ -691,27 +717,29 @@ int main(int argc, char *argv[]) {
 				continue;
 
 			if (!list_empty(&whitelisted_subnets) &&
-			    !subnet_match(&fromaddr, &whitelisted_subnets)) {
+			    !subnet_match(&recv_sock->from_in, &whitelisted_subnets)) {
 				if (foreground)
-					printf("skipping packet from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
+					printf("skipping packet from=%s size=%zd\n",
+					       recv_sock->from_str, recvsize);
 				continue;
 			}
 
-			if (subnet_match(&fromaddr, &blacklisted_subnets)) {
+			if (subnet_match(&recv_sock->from_in, &blacklisted_subnets)) {
 				if (foreground)
-					printf("skipping packet from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
+					printf("skipping packet from=%s size=%zd\n",
+					       recv_sock->from_str, recvsize);
 				continue;
 			}
 
 			if (foreground)
-				printf("data from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
-
+				printf("data from=%s size=%zd\n",
+				       recv_sock->from_str, recvsize);
 
 			list_for_each_entry(send_sock, &send_socks, list) {
 				ssize_t sentsize;
 
 				// do not repeat packet back to the same network from which it originated
-				if ((fromaddr.sin_addr.s_addr & send_sock->mask.s_addr) == send_sock->net.s_addr)
+				if ((recv_sock->from_in.sin_addr.s_addr & send_sock->mask.s_addr) == send_sock->net.s_addr)
 					continue;
 
 				if (foreground)
