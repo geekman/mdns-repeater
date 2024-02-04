@@ -63,7 +63,7 @@ struct subnet {
 int server_sockfd = -1;
 
 int num_socks = 0;
-struct if_sock socks[MAX_SOCKS];
+struct if_sock *socks[MAX_SOCKS];
 
 int num_blacklisted_subnets = 0;
 struct subnet blacklisted_subnets[MAX_SUBNETS];
@@ -139,9 +139,10 @@ static int create_recv_sock() {
 	return sd;
 }
 
-static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock *sockdata) {
-	int r = -1;
-	int sd;
+static struct if_sock *
+create_send_sock(int recv_sockfd, const char *ifname) {
+	struct if_sock *sockdata;
+	int sd = -1;
 	struct ifreq ifr;
 	struct in_addr *if_addr = &((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr;
 	int on = 1;
@@ -152,10 +153,15 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 	char *mask_str;
 	char *net_str;
 
+	sockdata = malloc(sizeof(*sockdata));
+	if (!sockdata) {
+		log_message(LOG_ERR, "malloc(): %s", strerror(errno));
+		goto out;
+	}
+
 	sd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (sd < 0) {
 		log_message(LOG_ERR, "send socket(): %s", strerror(errno));
-		r = sd;
 		goto out;
 	}
 
@@ -166,7 +172,7 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 	strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
 
 #ifdef SO_BINDTODEVICE
-	if ((r = setsockopt(sd, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(struct ifreq))) < 0) {
+	if (setsockopt(sd, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(struct ifreq)) < 0) {
 		log_message(LOG_ERR, "send setsockopt(SO_BINDTODEVICE): %s", strerror(errno));
 		goto out;
 	}
@@ -189,7 +195,7 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 	// compute network (address & mask)
 	sockdata->net.s_addr = sockdata->addr.s_addr & sockdata->mask.s_addr;
 
-	if ((r = setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) < 0) {
+	if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
 		log_message(LOG_ERR, "send setsockopt(SO_REUSEADDR): %s", strerror(errno));
 		goto out;
 	}
@@ -199,13 +205,13 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 	serveraddr.sin_family = AF_INET;
 	serveraddr.sin_port = htons(MDNS_PORT);
 	serveraddr.sin_addr.s_addr = if_addr->s_addr;
-	if ((r = bind(sd, (struct sockaddr *)&serveraddr, sizeof(serveraddr))) < 0) {
+	if (bind(sd, (struct sockaddr *)&serveraddr, sizeof(serveraddr)) < 0) {
 		log_message(LOG_ERR, "send bind(): %s", strerror(errno));
 		goto out;
 	}
 
 #if __FreeBSD__
-	if ((r = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_IF, &serveraddr.sin_addr, sizeof(serveraddr.sin_addr))) < 0) {
+	if (setsockopt(sd, IPPROTO_IP, IP_MULTICAST_IF, &serveraddr.sin_addr, sizeof(serveraddr.sin_addr)) < 0) {
 		log_message(LOG_ERR, "send ip_multicast_if(): %s", strerror(errno));
 		goto out;
 	}
@@ -215,18 +221,18 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 	memset(&mreq, 0, sizeof(mreq));
 	mreq.imr_interface.s_addr = if_addr->s_addr;
 	mreq.imr_multiaddr.s_addr = inet_addr(MDNS_ADDR);
-	if ((r = setsockopt(recv_sockfd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq))) < 0) {
+	if (setsockopt(recv_sockfd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
 		log_message(LOG_ERR, "recv setsockopt(IP_ADD_MEMBERSHIP): %s", strerror(errno));
 		goto out;
 	}
 
 	// enable loopback in case someone else needs the data
-	if ((r = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_LOOP, &on, sizeof(on))) < 0) {
+	if (setsockopt(sd, IPPROTO_IP, IP_MULTICAST_LOOP, &on, sizeof(on)) < 0) {
 		log_message(LOG_ERR, "send setsockopt(IP_MULTICAST_LOOP): %s", strerror(errno));
 		goto out;
 	}
 
-	if ((r = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl))) < 0) {
+	if (setsockopt(sd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl)) < 0) {
 		log_message(LOG_ERR, "send setsockopt(IP_MULTICAST_TTL): %s", strerror(errno));
 		goto out;
 	}
@@ -239,11 +245,12 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 	free(mask_str);
 	free(net_str);
 
-	return sd;
+	return sockdata;
 
 out:
+	free(sockdata);
 	close(sd);
-	return r;
+	return NULL;
 }
 
 static ssize_t send_packet(int fd, const void *data, size_t len) {
@@ -562,8 +569,8 @@ int main(int argc, char *argv[]) {
 			exit(2);
 		}
 
-		int sockfd = create_send_sock(server_sockfd, argv[i], &socks[num_socks]);
-		if (sockfd < 0) {
+		socks[num_socks] = create_send_sock(server_sockfd, argv[i]);
+		if (!socks[num_socks]) {
 			log_message(LOG_ERR, "unable to create socket for interface %s", argv[i]);
 			r = 1;
 			goto end_main;
@@ -620,12 +627,12 @@ int main(int argc, char *argv[]) {
 			char our_net = 0;
 			for (j = 0; j < num_socks; j++) {
 				// make sure packet originated from specified networks
-				if ((fromaddr.sin_addr.s_addr & socks[j].mask.s_addr) == socks[j].net.s_addr) {
+				if ((fromaddr.sin_addr.s_addr & socks[j]->mask.s_addr) == socks[j]->net.s_addr) {
 					our_net = 1;
 				}
 
 				// check for loopback
-				if (fromaddr.sin_addr.s_addr == socks[j].addr.s_addr) {
+				if (fromaddr.sin_addr.s_addr == socks[j]->addr.s_addr) {
 					discard = 1;
 					break;
 				}
@@ -671,14 +678,14 @@ int main(int argc, char *argv[]) {
 
 			for (j = 0; j < num_socks; j++) {
 				// do not repeat packet back to the same network from which it originated
-				if ((fromaddr.sin_addr.s_addr & socks[j].mask.s_addr) == socks[j].net.s_addr)
+				if ((fromaddr.sin_addr.s_addr & socks[j]->mask.s_addr) == socks[j]->net.s_addr)
 					continue;
 
 				if (foreground)
-					printf("repeating data to %s\n", socks[j].ifname);
+					printf("repeating data to %s\n", socks[j]->ifname);
 
 				// repeat data
-				ssize_t sentsize = send_packet(socks[j].sockfd, pkt_data, (size_t) recvsize);
+				ssize_t sentsize = send_packet(socks[j]->sockfd, pkt_data, (size_t) recvsize);
 				if (sentsize != recvsize) {
 					if (sentsize < 0)
 						log_message(LOG_ERR, "send(): %s", strerror(errno));
@@ -700,8 +707,10 @@ end_main:
 	if (server_sockfd >= 0)
 		close(server_sockfd);
 
-	for (i = 0; i < num_socks; i++)
-		close(socks[i].sockfd);
+	for (i = 0; i < num_socks; i++) {
+		close(socks[i]->sockfd);
+		free(socks[i]);
+	}
 
 	// remove pid file if it belongs to us
 	if (already_running() == getpid())
