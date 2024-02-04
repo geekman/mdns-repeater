@@ -47,6 +47,8 @@
 #define PIDFILE "/var/run/" PACKAGE ".pid"
 #endif
 
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+
 struct send_sock {
 	const char *ifname;	/* interface name  */
 	int sockfd;		/* socket filedesc */
@@ -73,10 +75,20 @@ struct recv_sock {
 LIST_HEAD(recv_socks);
 
 struct subnet {
-	struct in_addr addr;    /* subnet addr */
-	struct in_addr mask;    /* subnet mask */
-	struct in_addr net;     /* subnet net (computed) */
-	struct list_head list;	/* subnet list */
+	union {
+		struct sockaddr_storage addr;	/* subnet addr		*/
+		struct sockaddr_in6 addr_in6;	/* subnet addr (IPv6)	*/
+		struct sockaddr_in addr_in;	/* subnet addr (IPv4)	*/
+	};
+	union {
+		struct in6_addr mask_in6;	/* subnet mask (IPv6)	*/
+		struct in_addr mask_in;		/* subnet mask (IPv4)	*/
+	};
+	union {
+		struct in6_addr net_in6;	/* subnet net (IPv6)	*/
+		struct in_addr net_in;		/* subnet net (IPv4)	*/
+	};
+	struct list_head list;			/* subnet list		*/
 };
 LIST_HEAD(blacklisted_subnets);
 LIST_HEAD(whitelisted_subnets);
@@ -108,8 +120,9 @@ void log_message(int loglevel, char *fmt_str, ...) {
 }
 
 static char *
-addr_mask_net_to_string(struct in_addr *addr, struct in_addr *mask,
-			struct in_addr *net) {
+addr6_mask_net_to_string(struct sockaddr_in6 *addr,
+			 struct in6_addr *mask,
+			 struct in6_addr *net) {
 	const char *fmt = "addr %s mask %s net %s";
 	/* sizeof(fmt) = some extra bytes, and it's compile-time constant */
 	static char msg[sizeof(fmt) + 3 * INET6_ADDRSTRLEN];
@@ -118,7 +131,28 @@ addr_mask_net_to_string(struct in_addr *addr, struct in_addr *mask,
 	char netbuf[INET6_ADDRSTRLEN];
 
 	snprintf(msg, sizeof(msg), fmt,
-		 inet_ntop(AF_INET, addr, addrbuf, sizeof(addrbuf)),
+		 inet_ntop(AF_INET6, &addr->sin6_addr,
+			   addrbuf, sizeof(addrbuf)),
+		 inet_ntop(AF_INET6, mask, maskbuf, sizeof(maskbuf)),
+		 inet_ntop(AF_INET6, net, netbuf, sizeof(netbuf)));
+
+	return msg;
+}
+
+static char *
+addr4_mask_net_to_string(struct sockaddr_in *addr,
+			 struct in_addr *mask,
+			 struct in_addr *net) {
+	const char *fmt = "addr %s mask %s net %s";
+	/* sizeof(fmt) = some extra bytes, and it's compile-time constant */
+	static char msg[sizeof(fmt) + 3 * INET_ADDRSTRLEN];
+	char addrbuf[INET_ADDRSTRLEN];
+	char maskbuf[INET_ADDRSTRLEN];
+	char netbuf[INET_ADDRSTRLEN];
+
+	snprintf(msg, sizeof(msg), fmt,
+		 inet_ntop(AF_INET, &addr->sin_addr,
+			   addrbuf, sizeof(addrbuf)),
 		 inet_ntop(AF_INET, mask, maskbuf, sizeof(maskbuf)),
 		 inet_ntop(AF_INET, net, netbuf, sizeof(netbuf)));
 
@@ -127,16 +161,28 @@ addr_mask_net_to_string(struct in_addr *addr, struct in_addr *mask,
 
 static char *
 send_sock_to_string(struct send_sock *sock) {
-	return addr_mask_net_to_string(&sock->addr,
-				       &sock->mask,
-				       &sock->net);
+	struct sockaddr_storage addr;
+	struct sockaddr_in *addr_in = (struct sockaddr_in *)&addr;
+
+	addr.ss_family = AF_INET;
+	memcpy(&addr_in->sin_addr, &sock->addr, sizeof(addr_in->sin_addr));
+	return addr4_mask_net_to_string(addr_in, &sock->mask, &sock->net);
 }
 
 static char *
 subnet_to_string(struct subnet *subnet) {
-	return addr_mask_net_to_string(&subnet->addr,
-				       &subnet->mask,
-				       &subnet->net);
+	switch (subnet->addr.ss_family) {
+	case AF_INET6:
+		return addr6_mask_net_to_string(&subnet->addr_in6,
+						&subnet->mask_in6,
+						&subnet->net_in6);
+	case AF_INET:
+		return addr4_mask_net_to_string(&subnet->addr_in,
+						&subnet->mask_in,
+						&subnet->net_in);
+	default:
+		return "ERROR";
+	}
 }
 
 static struct recv_sock *
@@ -428,12 +474,19 @@ static void show_help(const char *progname) {
 		);
 }
 
+/*
+ * Expected input, strings of the form:
+ *   192.168.0.12/24
+ *   2001:db8::/32
+ */
 static struct subnet *
 parse_subnet(const char *input) {
 	struct subnet *subnet;
-	char *addr = NULL;
+	char *addr_str = NULL;
 	char *delim;
-	int mask;
+	struct in6_addr *addr_in6;
+	struct in_addr *addr_in;
+	int prefix_len;
 
 	subnet = malloc(sizeof(*subnet));
 	if (!subnet) {
@@ -442,38 +495,67 @@ parse_subnet(const char *input) {
 	}
 	memset(subnet, 0, sizeof(*subnet));
 
-	addr = strdup(input);
-	if (!addr) {
+	addr_str = strdup(input);
+	if (!addr_str) {
 		log_message(LOG_ERR, "strdup(): %s", strerror(errno));
 		goto out;
 	}
 
-	delim = strchr(addr, '/');
+	delim = strchr(addr_str, '/');
 	if (!delim) {
 		log_message(LOG_ERR, "invalid blacklist/whitelist argument: %s", input);
 		goto out;
 	}
-	*delim = '\0';
 
-	if (inet_pton(AF_INET, addr, &subnet->addr) != 1) {
+	*delim = '\0';
+	delim++;
+	prefix_len = atoi(delim);
+	if (prefix_len < 0) {
+		log_message(LOG_ERR, "invalid blacklist/whitelist prefix length: %s", input);
+		goto out;
+	}
+
+	addr_in6 = &subnet->addr_in6.sin6_addr;
+	addr_in = &subnet->addr_in.sin_addr;
+
+	// First, try parsing an IPv6 address
+	if (inet_pton(AF_INET6, addr_str, addr_in6) == 1) {
+		if (prefix_len > 128) {
+			log_message(LOG_ERR, "blacklist/whitelist prefix length > 128: %s", input);
+			goto out;
+		}
+
+		for (int i = 0; i < sizeof(addr_in6->s6_addr); i++) {
+			uint8_t mask = 0xff << (8 - MIN(prefix_len, 8));
+			prefix_len -= MIN(prefix_len, 8);
+			subnet->mask_in6.s6_addr[i] = mask;
+			subnet->net_in6.s6_addr[i] = addr_in6->s6_addr[i] & mask;
+		}
+
+		subnet->addr.ss_family = AF_INET6;
+
+	// Second, try parsing an IPv4 address
+	} else if (inet_pton(AF_INET, addr_str, addr_in) == 1) {
+		if (prefix_len > 32) {
+			log_message(LOG_ERR, "blacklist/whitelist prefix length > 32: %s", input);
+			goto out;
+		}
+
+		subnet->mask_in.s_addr = ntohl(0xFFFFFFFF << (32 - prefix_len));
+		subnet->net_in.s_addr = addr_in->s_addr & subnet->mask_in.s_addr;
+		subnet->addr.ss_family = AF_INET;
+
+	// Give up
+	} else {
 		log_message(LOG_ERR, "could not parse blacklist/whitelist netmask: %s", input);
 		goto out;
 	}
 
-	delim++;
-	mask = atoi(delim);
-	if (mask < 0 || mask > 32) {
-		log_message(LOG_ERR, "invalid blacklist/whitelist netmask: %s", input);
-		goto out;
-	}
-	free(addr);
-
-	subnet->mask.s_addr = ntohl((uint32_t)0xFFFFFFFF << (32 - mask));
-	subnet->net.s_addr = subnet->addr.s_addr & subnet->mask.s_addr;
+	free(addr_str);
 	return subnet;
 
 out:
-	free(addr);
+	free(addr_str);
 	free(subnet);
 	return NULL;
 }
@@ -483,9 +565,13 @@ subnet_match(struct sockaddr_in *fromaddr, struct list_head *subnets)
 {
 	struct subnet *subnet;
 
-	list_for_each_entry(subnet, subnets, list)
-		if ((fromaddr->sin_addr.s_addr & subnet->mask.s_addr) == subnet->net.s_addr)
+	list_for_each_entry(subnet, subnets, list) {
+		if (subnet->addr.ss_family != AF_INET)
+			continue;
+
+		if ((fromaddr->sin_addr.s_addr & subnet->mask_in.s_addr) == subnet->net_in.s_addr)
 			return true;
+	}
 
 	return false;
 }
