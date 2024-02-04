@@ -57,6 +57,15 @@ struct if_sock {
 };
 LIST_HEAD(send_socks);
 
+#define PACKET_SIZE 65536
+struct recv_sock {
+	const char *name;		/* name of this socket  */
+	int sockfd;			/* socket fd            */
+	char pkt_data[PACKET_SIZE];	/* incoming packet data */
+	struct list_head list;		/* socket list          */
+};
+LIST_HEAD(recv_socks);
+
 struct subnet {
 	struct in_addr addr;    /* subnet addr */
 	struct in_addr mask;    /* subnet mask */
@@ -65,11 +74,6 @@ struct subnet {
 };
 LIST_HEAD(blacklisted_subnets);
 LIST_HEAD(whitelisted_subnets);
-
-int server_sockfd = -1;
-
-#define PACKET_SIZE 65536
-void *pkt_data = NULL;
 
 bool foreground = false;
 
@@ -129,56 +133,70 @@ subnet_to_string(struct subnet *subnet) {
 				       &subnet->net);
 }
 
-static int create_recv_sock() {
-	int sd = socket(AF_INET, SOCK_DGRAM, 0);
-	if (sd < 0) {
-		log_message(LOG_ERR, "recv socket(): %s", strerror(errno));
-		return sd;
+static struct recv_sock *
+create_recv_sock() {
+	struct recv_sock *sock;
+	int sd;
+	int on = 1;
+	struct sockaddr_in serveraddr;
+
+	sock = malloc(sizeof(*sock));
+	if (!sock) {
+		log_message(LOG_ERR, "malloc(): %s", strerror(errno));
+		goto out;
 	}
 
-	int r = -1;
+	sd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sd < 0) {
+		log_message(LOG_ERR, "recv socket(): %s", strerror(errno));
+		goto out;
+	}
+	sock->sockfd = sd;
 
-	int on = 1;
-	if ((r = setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) < 0) {
+	if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
 		log_message(LOG_ERR, "recv setsockopt(SO_REUSEADDR): %s", strerror(errno));
-		return r;
+		goto out;
 	}
 
 	/* bind to an address */
-	struct sockaddr_in serveraddr;
 	memset(&serveraddr, 0, sizeof(serveraddr));
 	serveraddr.sin_family = AF_INET;
 	serveraddr.sin_port = htons(MDNS_PORT);
 	serveraddr.sin_addr.s_addr = htonl(INADDR_ANY);	/* receive multicast */
-	if ((r = bind(sd, (struct sockaddr *)&serveraddr, sizeof(serveraddr))) < 0) {
+	if (bind(sd, (struct sockaddr *)&serveraddr, sizeof(serveraddr)) < 0) {
 		log_message(LOG_ERR, "recv bind(): %s", strerror(errno));
-		return r;
+		goto out;
 	}
 
 	// enable loopback in case someone else needs the data
-	if ((r = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_LOOP, &on, sizeof(on))) < 0) {
+	if (setsockopt(sd, IPPROTO_IP, IP_MULTICAST_LOOP, &on, sizeof(on)) < 0) {
 		log_message(LOG_ERR, "recv setsockopt(IP_MULTICAST_LOOP): %s", strerror(errno));
-		return r;
+		goto out;
 	}
 
 #ifdef IP_PKTINFO
-	if ((r = setsockopt(sd, SOL_IP, IP_PKTINFO, &on, sizeof(on))) < 0) {
+	if (setsockopt(sd, SOL_IP, IP_PKTINFO, &on, sizeof(on)) < 0) {
 		log_message(LOG_ERR, "recv setsockopt(IP_PKTINFO): %s", strerror(errno));
-		return r;
+		goto out;
 	}
 #endif
 
-	return sd;
+	return sock;
+
+out:
+	free(sock);
+	return NULL;
 }
 
 static struct if_sock *
-create_send_sock(int recv_sockfd, const char *ifname) {
+create_send_sock(const char *ifname, struct list_head *recv_socks) {
 	struct if_sock *sockdata;
 	int sd = -1;
 	struct ifreq ifr;
 	struct in_addr *if_addr = &((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr;
 	int on = 1;
 	struct sockaddr_in serveraddr;
+	struct recv_sock *recv_sock;
 	struct ip_mreq mreq;
 	int ttl = 255; // IP TTL should be 255: https://datatracker.ietf.org/doc/html/rfc6762#section-11
 
@@ -246,13 +264,16 @@ create_send_sock(int recv_sockfd, const char *ifname) {
 	}
 #endif
 
-	// add membership to receiving socket
+	// add membership to receiving sockets
 	memset(&mreq, 0, sizeof(mreq));
 	mreq.imr_interface.s_addr = if_addr->s_addr;
 	mreq.imr_multiaddr.s_addr = inet_addr(MDNS_ADDR);
-	if (setsockopt(recv_sockfd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
-		log_message(LOG_ERR, "recv setsockopt(IP_ADD_MEMBERSHIP): %s", strerror(errno));
-		goto out;
+	list_for_each_entry(recv_sock, recv_socks, list) {
+		if (setsockopt(recv_sock->sockfd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+			       &mreq, sizeof(mreq)) < 0) {
+			log_message(LOG_ERR, "recv setsockopt(IP_ADD_MEMBERSHIP): %s", strerror(errno));
+			goto out;
+		}
 	}
 
 	// enable loopback in case someone else needs the data
@@ -537,7 +558,11 @@ int main(int argc, char *argv[]) {
 	pid_t running_pid;
 	int r = 0;
 	struct if_sock *sock, *tmp_sock;
+	struct recv_sock *recv_sock, *tmp_recv_sock;
 	struct subnet *subnet, *tmp_subnet;
+	int pfds_count = 0;
+	int pfds_used = 0;
+	struct pollfd *pfds;
 
 	parse_opts(argc, argv);
 
@@ -554,18 +579,21 @@ int main(int argc, char *argv[]) {
 		log_message(LOG_ERR, "pipe(): %s", strerror(errno));
 		goto end_main;
 	}
+	pfds_count++;
 
-	// create receiving socket
-	server_sockfd = create_recv_sock();
-	if (server_sockfd < 0) {
+	// create receiving sockets
+	recv_sock = create_recv_sock();
+	if (!recv_sock) {
 		log_message(LOG_ERR, "unable to create server socket");
 		r = 1;
 		goto end_main;
 	}
+	list_add(&recv_sock->list, &recv_socks);
+	pfds_count++;
 
 	// create sending sockets
 	for (int i = optind; i < argc; i++) {
-		sock = create_send_sock(server_sockfd, argv[i]);
+		sock = create_send_sock(argv[i], &recv_socks);
 		if (!sock) {
 			log_message(LOG_ERR, "unable to create socket for interface %s", argv[i]);
 			r = 1;
@@ -590,43 +618,60 @@ int main(int argc, char *argv[]) {
 		}
 	}
 
-	pkt_data = malloc(PACKET_SIZE);
-	if (pkt_data == NULL) {
-		log_message(LOG_ERR, "cannot malloc() packet buffer: %s", strerror(errno));
+	pfds = calloc(pfds_count, sizeof(struct pollfd));
+	if (!pfds) {
+		log_message(LOG_ERR, "malloc(): %s", strerror(errno));
 		r = 1;
 		goto end_main;
 	}
 
-	int pfd_count = 2;
-	struct pollfd pfds[2] = {
-		{
-			.fd = signal_pipe_fds[PIPE_RD],
-			.events = POLLIN,
-		}, {
-			.fd = server_sockfd,
-			.events = POLLIN,
-		}
-	};
+	pfds[pfds_used].fd = signal_pipe_fds[PIPE_RD];
+	pfds[pfds_used].events = POLLIN;
+	pfds_used++;
+
+	list_for_each_entry(recv_sock, &recv_socks, list) {
+		pfds[pfds_used].fd = recv_sock->sockfd;
+		pfds[pfds_used].events = POLLIN;
+		pfds_used++;
+	}
 
 	while (true) {
-		r = poll(pfds, pfd_count, -1);
+		r = poll(pfds, pfds_used, -1);
 		if (r <= 0)
 			continue;
 
 		if (pfds[0].revents & POLLIN)
 			break;
 
-		if (pfds[1].revents & POLLIN) {
+		for (int i = 1; i < pfds_used; i++) {
 			struct sockaddr_in fromaddr;
 			socklen_t sockaddr_size = sizeof(struct sockaddr_in);
 			ssize_t recvsize;
 			bool discard = false;
 			bool our_net = false;
 
-			recvsize = recvfrom(server_sockfd, pkt_data, PACKET_SIZE, 0,
-					    (struct sockaddr *) &fromaddr, &sockaddr_size);
+			if (!(pfds[i].revents & POLLIN))
+				continue;
+
+			recv_sock = NULL;
+			list_for_each_entry(tmp_recv_sock, &recv_socks, list) {
+				if (tmp_recv_sock->sockfd == pfds[i].fd) {
+					recv_sock = tmp_recv_sock;
+					break;
+				}
+			}
+
+			if (!recv_sock)
+				continue;
+
+			recvsize = recvfrom(recv_sock->sockfd,
+					    recv_sock->pkt_data,
+					    sizeof(recv_sock->pkt_data), 0,
+					    (struct sockaddr *)&fromaddr,
+					    &sockaddr_size);
 			if (recvsize < 0) {
 				log_message(LOG_ERR, "recv(): %s", strerror(errno));
+				continue;
 			}
 
 			list_for_each_entry(sock, &send_socks, list) {
@@ -673,7 +718,7 @@ int main(int argc, char *argv[]) {
 					printf("repeating data to %s\n", sock->ifname);
 
 				// repeat data
-				sentsize = send_packet(sock->sockfd, pkt_data, (size_t)recvsize);
+				sentsize = send_packet(sock->sockfd, recv_sock->pkt_data, recvsize);
 				if (sentsize != recvsize) {
 					if (sentsize < 0)
 						log_message(LOG_ERR, "send(): %s", strerror(errno));
@@ -688,12 +733,11 @@ int main(int argc, char *argv[]) {
 	log_message(LOG_INFO, "shutting down...");
 
 end_main:
-
-	if (pkt_data != NULL)
-		free(pkt_data);
-
-	if (server_sockfd >= 0)
-		close(server_sockfd);
+	list_for_each_entry_safe(recv_sock, tmp_recv_sock, &recv_socks, list) {
+		list_del(&recv_sock->list);
+		close(recv_sock->sockfd);
+		free(recv_sock);
+	}
 
 	list_for_each_entry_safe(sock, tmp_sock, &send_socks, list) {
 		list_del(&sock->list);
