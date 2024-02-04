@@ -383,39 +383,30 @@ static void show_help(const char *progname) {
 static bool
 parse_subnet(const char *input, struct subnet *s) {
 	bool r = false;
-	int delim = 0;
-	int end = 0;
 	char *addr = NULL;
+	char *delim;
 	int mask;
 
-	while (input[end] != '\0') {
-		if (input[end] == '/')
-			delim = end;
-		end++;
+	addr = strdup(input);
+	if (!addr) {
+		log_message(LOG_ERR, "strdup(): %s", strerror(errno));
+		goto out;
 	}
 
-	if (end == 0 || delim == 0 || end == delim) {
+	delim = strchr(addr, '/');
+	if (!delim) {
 		log_message(LOG_ERR, "invalid blacklist/whitelist argument: %s", input);
 		goto out;
 	}
+	*delim = '\0';
 
-	addr = malloc(end);
-	if (!addr) {
-		log_message(LOG_ERR, "malloc(): %s", strerror(errno));
-		goto out;
-	}
-
-	memset(addr, 0, end);
-	strncpy(addr, input, delim);
 	if (inet_pton(AF_INET, addr, &s->addr) != 1) {
 		log_message(LOG_ERR, "could not parse blacklist/whitelist netmask: %s", input);
 		goto out;
 	}
 
-	memset(addr, 0, end);
-	strncpy(addr, input+delim+1, end-delim-1);
-	mask = atoi(addr);
-
+	delim++;
+	mask = atoi(delim);
 	if (mask < 0 || mask > 32) {
 		log_message(LOG_ERR, "invalid blacklist/whitelist netmask: %s", input);
 		goto out;
