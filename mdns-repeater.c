@@ -47,7 +47,7 @@
 #define PIDFILE "/var/run/" PACKAGE ".pid"
 #endif
 
-struct if_sock {
+struct send_sock {
 	const char *ifname;	/* interface name  */
 	int sockfd;		/* socket filedesc */
 	struct in_addr addr;	/* interface addr  */
@@ -120,7 +120,7 @@ addr_mask_net_to_string(struct in_addr *addr, struct in_addr *mask,
 }
 
 static char *
-if_sock_to_string(struct if_sock *sock) {
+send_sock_to_string(struct send_sock *sock) {
 	return addr_mask_net_to_string(&sock->addr,
 				       &sock->mask,
 				       &sock->net);
@@ -188,9 +188,9 @@ out:
 	return NULL;
 }
 
-static struct if_sock *
+static struct send_sock *
 create_send_sock(const char *ifname, struct list_head *recv_socks) {
-	struct if_sock *sockdata;
+	struct send_sock *sockdata;
 	int sd = -1;
 	struct ifreq ifr;
 	struct in_addr *if_addr = &((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr;
@@ -287,7 +287,7 @@ create_send_sock(const char *ifname, struct list_head *recv_socks) {
 		goto out;
 	}
 
-	log_message(LOG_INFO, "dev %s %s", ifr.ifr_name, if_sock_to_string(sockdata));
+	log_message(LOG_INFO, "dev %s %s", ifr.ifr_name, send_sock_to_string(sockdata));
 	return sockdata;
 
 out:
@@ -557,7 +557,7 @@ static int parse_opts(int argc, char *argv[]) {
 int main(int argc, char *argv[]) {
 	pid_t running_pid;
 	int r = 0;
-	struct if_sock *sock, *tmp_sock;
+	struct send_sock *send_sock, *tmp_send_sock;
 	struct recv_sock *recv_sock, *tmp_recv_sock;
 	struct subnet *subnet, *tmp_subnet;
 	int pfds_count = 0;
@@ -593,14 +593,14 @@ int main(int argc, char *argv[]) {
 
 	// create sending sockets
 	for (int i = optind; i < argc; i++) {
-		sock = create_send_sock(argv[i], &recv_socks);
-		if (!sock) {
+		send_sock = create_send_sock(argv[i], &recv_socks);
+		if (!send_sock) {
 			log_message(LOG_ERR, "unable to create socket for interface %s", argv[i]);
 			r = 1;
 			goto end_main;
 		}
 
-		list_add(&sock->list, &send_socks);
+		list_add(&send_sock->list, &send_socks);
 	}
 
 	if (user) {
@@ -674,14 +674,14 @@ int main(int argc, char *argv[]) {
 				continue;
 			}
 
-			list_for_each_entry(sock, &send_socks, list) {
+			list_for_each_entry(send_sock, &send_socks, list) {
 				// make sure packet originated from specified networks
-				if ((fromaddr.sin_addr.s_addr & sock->mask.s_addr) == sock->net.s_addr) {
+				if ((fromaddr.sin_addr.s_addr & send_sock->mask.s_addr) == send_sock->net.s_addr) {
 					our_net = true;
 				}
 
 				// check for loopback
-				if (fromaddr.sin_addr.s_addr == sock->addr.s_addr) {
+				if (fromaddr.sin_addr.s_addr == send_sock->addr.s_addr) {
 					discard = true;
 					break;
 				}
@@ -707,18 +707,18 @@ int main(int argc, char *argv[]) {
 				printf("data from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
 
 
-			list_for_each_entry(sock, &send_socks, list) {
+			list_for_each_entry(send_sock, &send_socks, list) {
 				ssize_t sentsize;
 
 				// do not repeat packet back to the same network from which it originated
-				if ((fromaddr.sin_addr.s_addr & sock->mask.s_addr) == sock->net.s_addr)
+				if ((fromaddr.sin_addr.s_addr & send_sock->mask.s_addr) == send_sock->net.s_addr)
 					continue;
 
 				if (foreground)
-					printf("repeating data to %s\n", sock->ifname);
+					printf("repeating data to %s\n", send_sock->ifname);
 
 				// repeat data
-				sentsize = send_packet(sock->sockfd, recv_sock->pkt_data, recvsize);
+				sentsize = send_packet(send_sock->sockfd, recv_sock->pkt_data, recvsize);
 				if (sentsize != recvsize) {
 					if (sentsize < 0)
 						log_message(LOG_ERR, "send(): %s", strerror(errno));
@@ -739,10 +739,10 @@ end_main:
 		free(recv_sock);
 	}
 
-	list_for_each_entry_safe(sock, tmp_sock, &send_socks, list) {
-		list_del(&sock->list);
-		close(sock->sockfd);
-		free(sock);
+	list_for_each_entry_safe(send_sock, tmp_send_sock, &send_socks, list) {
+		list_del(&send_sock->list);
+		close(send_sock->sockfd);
+		free(send_sock);
 	}
 
 	list_for_each_entry_safe(subnet, tmp_subnet, &blacklisted_subnets, list) {
