@@ -34,6 +34,7 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <errno.h>
+#include <stdbool.h>
 
 #define PACKAGE "mdns-repeater"
 #define MDNS_ADDR "224.0.0.251"
@@ -74,8 +75,8 @@ struct subnet whitelisted_subnets[MAX_SUBNETS];
 #define PACKET_SIZE 65536
 void *pkt_data = NULL;
 
-int foreground = 0;
-int shutdown_flag = 0;
+bool foreground = false;
+bool shutdown_flag = false;
 
 char *pid_file = PIDFILE;
 
@@ -267,7 +268,7 @@ static ssize_t send_packet(int fd, const void *data, size_t len) {
 
 static void mdns_repeater_shutdown(int sig) {
 	(void)sig;
-	shutdown_flag = 1;
+	shutdown_flag = true;
 }
 
 static pid_t already_running() {
@@ -431,13 +432,20 @@ int tostring(struct subnet *s, char* buf, int len) {
 
 static int parse_opts(int argc, char *argv[]) {
 	int c, res;
-	int help = 0;
+	bool help = false;
 	struct subnet *ss;
 	char *msg;
+
 	while ((c = getopt(argc, argv, "hfp:b:w:u:")) != -1) {
 		switch (c) {
-			case 'h': help = 1; break;
-			case 'f': foreground = 1; break;
+			case 'h':
+				help = true;
+				break;
+
+			case 'f':
+				foreground = true;
+				break;
+
 			case 'p':
 				if (optarg[0] != '/')
 					log_message(LOG_ERR, "pid file path must be absolute");
@@ -582,7 +590,7 @@ int main(int argc, char *argv[]) {
 		switch_user();
 	}
 
-	if (! foreground)
+	if (!foreground)
 		daemonize();
 	else {
 		// check for pid file when running in foreground
@@ -600,7 +608,7 @@ int main(int argc, char *argv[]) {
 		goto end_main;
 	}
 
-	while (! shutdown_flag) {
+	while (!shutdown_flag) {
 		struct timeval tv = {
 			.tv_sec = 10,
 			.tv_usec = 0,
@@ -615,25 +623,26 @@ int main(int argc, char *argv[]) {
 		if (FD_ISSET(server_sockfd, &sockfd_set)) {
 			struct sockaddr_in fromaddr;
 			socklen_t sockaddr_size = sizeof(struct sockaddr_in);
+			ssize_t recvsize;
+			bool discard = false;
+			bool our_net = false;
 
-			ssize_t recvsize = recvfrom(server_sockfd, pkt_data, PACKET_SIZE, 0,
-				(struct sockaddr *) &fromaddr, &sockaddr_size);
+			recvsize = recvfrom(server_sockfd, pkt_data, PACKET_SIZE, 0,
+					    (struct sockaddr *) &fromaddr, &sockaddr_size);
 			if (recvsize < 0) {
 				log_message(LOG_ERR, "recv(): %s", strerror(errno));
 			}
 
 			int j;
-			char discard = 0;
-			char our_net = 0;
 			for (j = 0; j < num_socks; j++) {
 				// make sure packet originated from specified networks
 				if ((fromaddr.sin_addr.s_addr & socks[j]->mask.s_addr) == socks[j]->net.s_addr) {
-					our_net = 1;
+					our_net = true;
 				}
 
 				// check for loopback
 				if (fromaddr.sin_addr.s_addr == socks[j]->addr.s_addr) {
-					discard = 1;
+					discard = true;
 					break;
 				}
 			}
@@ -642,11 +651,11 @@ int main(int argc, char *argv[]) {
 				continue;
 
 			if (num_whitelisted_subnets != 0) {
-				char whitelisted_packet = 0;
+				bool whitelisted_packet = false;
 				for (j = 0; j < num_whitelisted_subnets; j++) {
 					// check for whitelist
 					if ((fromaddr.sin_addr.s_addr & whitelisted_subnets[j].mask.s_addr) == whitelisted_subnets[j].net.s_addr) {
-						whitelisted_packet = 1;
+						whitelisted_packet = true;
 						break;
 					}
 				}
@@ -657,11 +666,11 @@ int main(int argc, char *argv[]) {
 					continue;
 				}
 			} else {
-				char blacklisted_packet = 0;
+				bool blacklisted_packet = false;
 				for (j = 0; j < num_blacklisted_subnets; j++) {
 					// check for blacklist
 					if ((fromaddr.sin_addr.s_addr & blacklisted_subnets[j].mask.s_addr) == blacklisted_subnets[j].net.s_addr) {
-						blacklisted_packet = 1;
+						blacklisted_packet = true;
 						break;
 					}
 				}
