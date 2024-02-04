@@ -36,6 +36,8 @@
 #include <errno.h>
 #include <stdbool.h>
 
+#include "list.h"
+
 #define PACKAGE "mdns-repeater"
 #define MDNS_ADDR "224.0.0.251"
 #define MDNS_PORT 5353
@@ -44,7 +46,6 @@
 #define PIDFILE "/var/run/" PACKAGE ".pid"
 #endif
 
-#define MAX_SOCKS 16
 #define MAX_SUBNETS 16
 
 struct if_sock {
@@ -53,7 +54,9 @@ struct if_sock {
 	struct in_addr addr;	/* interface addr  */
 	struct in_addr mask;	/* interface mask  */
 	struct in_addr net;	/* interface network (computed) */
+	struct list_head list;	/* socket list     */
 };
+LIST_HEAD(send_socks);
 
 struct subnet {
 	struct in_addr addr;    /* subnet addr */
@@ -62,9 +65,6 @@ struct subnet {
 };
 
 int server_sockfd = -1;
-
-int num_socks = 0;
-struct if_sock *socks[MAX_SOCKS];
 
 int num_blacklisted_subnets = 0;
 struct subnet blacklisted_subnets[MAX_SUBNETS];
@@ -550,6 +550,7 @@ int main(int argc, char *argv[]) {
 	pid_t running_pid;
 	fd_set sockfd_set;
 	int r = 0;
+	struct if_sock *sock, *tmp_sock;
 
 	parse_opts(argc, argv);
 
@@ -570,20 +571,15 @@ int main(int argc, char *argv[]) {
 	}
 
 	// create sending sockets
-	int i;
-	for (i = optind; i < argc; i++) {
-		if (num_socks >= MAX_SOCKS) {
-			log_message(LOG_ERR, "too many sockets (maximum is %d)", MAX_SOCKS);
-			exit(2);
-		}
-
-		socks[num_socks] = create_send_sock(server_sockfd, argv[i]);
-		if (!socks[num_socks]) {
+	for (int i = optind; i < argc; i++) {
+		sock = create_send_sock(server_sockfd, argv[i]);
+		if (!sock) {
 			log_message(LOG_ERR, "unable to create socket for interface %s", argv[i]);
 			r = 1;
 			goto end_main;
 		}
-		num_socks++;
+
+		list_add(&sock->list, &send_socks);
 	}
 
 	if (user) {
@@ -633,15 +629,14 @@ int main(int argc, char *argv[]) {
 				log_message(LOG_ERR, "recv(): %s", strerror(errno));
 			}
 
-			int j;
-			for (j = 0; j < num_socks; j++) {
+			list_for_each_entry(sock, &send_socks, list) {
 				// make sure packet originated from specified networks
-				if ((fromaddr.sin_addr.s_addr & socks[j]->mask.s_addr) == socks[j]->net.s_addr) {
+				if ((fromaddr.sin_addr.s_addr & sock->mask.s_addr) == sock->net.s_addr) {
 					our_net = true;
 				}
 
 				// check for loopback
-				if (fromaddr.sin_addr.s_addr == socks[j]->addr.s_addr) {
+				if (fromaddr.sin_addr.s_addr == sock->addr.s_addr) {
 					discard = true;
 					break;
 				}
@@ -652,7 +647,7 @@ int main(int argc, char *argv[]) {
 
 			if (num_whitelisted_subnets != 0) {
 				bool whitelisted_packet = false;
-				for (j = 0; j < num_whitelisted_subnets; j++) {
+				for (int j = 0; j < num_whitelisted_subnets; j++) {
 					// check for whitelist
 					if ((fromaddr.sin_addr.s_addr & whitelisted_subnets[j].mask.s_addr) == whitelisted_subnets[j].net.s_addr) {
 						whitelisted_packet = true;
@@ -667,7 +662,7 @@ int main(int argc, char *argv[]) {
 				}
 			} else {
 				bool blacklisted_packet = false;
-				for (j = 0; j < num_blacklisted_subnets; j++) {
+				for (int j = 0; j < num_blacklisted_subnets; j++) {
 					// check for blacklist
 					if ((fromaddr.sin_addr.s_addr & blacklisted_subnets[j].mask.s_addr) == blacklisted_subnets[j].net.s_addr) {
 						blacklisted_packet = true;
@@ -685,16 +680,19 @@ int main(int argc, char *argv[]) {
 			if (foreground)
 				printf("data from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
 
-			for (j = 0; j < num_socks; j++) {
+
+			list_for_each_entry(sock, &send_socks, list) {
+				ssize_t sentsize;
+
 				// do not repeat packet back to the same network from which it originated
-				if ((fromaddr.sin_addr.s_addr & socks[j]->mask.s_addr) == socks[j]->net.s_addr)
+				if ((fromaddr.sin_addr.s_addr & sock->mask.s_addr) == sock->net.s_addr)
 					continue;
 
 				if (foreground)
-					printf("repeating data to %s\n", socks[j]->ifname);
+					printf("repeating data to %s\n", sock->ifname);
 
 				// repeat data
-				ssize_t sentsize = send_packet(socks[j]->sockfd, pkt_data, (size_t) recvsize);
+				sentsize = send_packet(sock->sockfd, pkt_data, (size_t)recvsize);
 				if (sentsize != recvsize) {
 					if (sentsize < 0)
 						log_message(LOG_ERR, "send(): %s", strerror(errno));
@@ -716,9 +714,10 @@ end_main:
 	if (server_sockfd >= 0)
 		close(server_sockfd);
 
-	for (i = 0; i < num_socks; i++) {
-		close(socks[i]->sockfd);
-		free(socks[i]);
+	list_for_each_entry_safe(sock, tmp_sock, &send_socks, list) {
+		list_del(&sock->list);
+		close(sock->sockfd);
+		free(sock);
 	}
 
 	// remove pid file if it belongs to us
