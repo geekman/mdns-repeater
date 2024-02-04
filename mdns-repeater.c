@@ -120,6 +120,7 @@ static int create_recv_sock() {
 	serveraddr.sin_addr.s_addr = htonl(INADDR_ANY);	/* receive multicast */
 	if ((r = bind(sd, (struct sockaddr *)&serveraddr, sizeof(serveraddr))) < 0) {
 		log_message(LOG_ERR, "recv bind(): %s", strerror(errno));
+		return r;
 	}
 
 	// enable loopback in case someone else needs the data
@@ -139,16 +140,16 @@ static int create_recv_sock() {
 }
 
 static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock *sockdata) {
+	int r = -1;
 	int sd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (sd < 0) {
 		log_message(LOG_ERR, "send socket(): %s", strerror(errno));
-		return sd;
+		r = sd;
+		goto out;
 	}
 
 	sockdata->ifname = ifname;
 	sockdata->sockfd = sd;
-
-	int r = -1;
 
 	struct ifreq ifr;
 	memset(&ifr, 0, sizeof(ifr));
@@ -158,19 +159,23 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 #ifdef SO_BINDTODEVICE
 	if ((r = setsockopt(sd, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(struct ifreq))) < 0) {
 		log_message(LOG_ERR, "send setsockopt(SO_BINDTODEVICE): %s", strerror(errno));
-		return r;
+		goto out;
 	}
 #endif
 
 	// get netmask
-	if (ioctl(sd, SIOCGIFNETMASK, &ifr) == 0) {
-		memcpy(&sockdata->mask, if_addr, sizeof(struct in_addr));
+	if (ioctl(sd, SIOCGIFNETMASK, &ifr) < 0) {
+		log_message(LOG_ERR, "ioctl(SIOCGIFNETMASK): %s", strerror(errno));
+		goto out;
 	}
+	memcpy(&sockdata->mask, if_addr, sizeof(*if_addr));
 
 	// .. and interface address
-	if (ioctl(sd, SIOCGIFADDR, &ifr) == 0) {
-		memcpy(&sockdata->addr, if_addr, sizeof(struct in_addr));
+	if (ioctl(sd, SIOCGIFADDR, &ifr) < 0) {
+		log_message(LOG_ERR, "ioctl(SIOCGIFADDR): %s", strerror(errno));
+		goto out;
 	}
+	memcpy(&sockdata->addr, if_addr, sizeof(*if_addr));
 
 	// compute network (address & mask)
 	sockdata->net.s_addr = sockdata->addr.s_addr & sockdata->mask.s_addr;
@@ -178,7 +183,7 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 	int on = 1;
 	if ((r = setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) < 0) {
 		log_message(LOG_ERR, "send setsockopt(SO_REUSEADDR): %s", strerror(errno));
-		return r;
+		goto out;
 	}
 
 	// bind to an address
@@ -189,34 +194,36 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 	serveraddr.sin_addr.s_addr = if_addr->s_addr;
 	if ((r = bind(sd, (struct sockaddr *)&serveraddr, sizeof(serveraddr))) < 0) {
 		log_message(LOG_ERR, "send bind(): %s", strerror(errno));
+		goto out;
 	}
 
 #if __FreeBSD__
-	if((r = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_IF, &serveraddr.sin_addr, sizeof(serveraddr.sin_addr))) < 0) {
-		log_message(LOG_ERR, "send ip_multicast_if(): errno %d: %s", errno, strerror(errno));
+	if ((r = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_IF, &serveraddr.sin_addr, sizeof(serveraddr.sin_addr))) < 0) {
+		log_message(LOG_ERR, "send ip_multicast_if(): %s", strerror(errno));
+		goto out;
 	}
 #endif
 
 	// add membership to receiving socket
 	struct ip_mreq mreq;
-	memset(&mreq, 0, sizeof(struct ip_mreq));
+	memset(&mreq, 0, sizeof(mreq));
 	mreq.imr_interface.s_addr = if_addr->s_addr;
 	mreq.imr_multiaddr.s_addr = inet_addr(MDNS_ADDR);
 	if ((r = setsockopt(recv_sockfd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq))) < 0) {
 		log_message(LOG_ERR, "recv setsockopt(IP_ADD_MEMBERSHIP): %s", strerror(errno));
-		return r;
+		goto out;
 	}
 
 	// enable loopback in case someone else needs the data
 	if ((r = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_LOOP, &on, sizeof(on))) < 0) {
 		log_message(LOG_ERR, "send setsockopt(IP_MULTICAST_LOOP): %s", strerror(errno));
-		return r;
+		goto out;
 	}
 
 	int ttl = 255; // IP TTL should be 255: https://datatracker.ietf.org/doc/html/rfc6762#section-11
 	if ((r = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl))) < 0) {
 		log_message(LOG_ERR, "send setsockopt(IP_MULTICAST_TTL): %s", strerror(errno));
-		return r;
+		goto out;
 	}
 
 	char *addr_str = strdup(inet_ntoa(sockdata->addr));
@@ -228,6 +235,10 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 	free(net_str);
 
 	return sd;
+
+out:
+	close(sd);
+	return r;
 }
 
 static ssize_t send_packet(int fd, const void *data, size_t len) {
