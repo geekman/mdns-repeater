@@ -141,7 +141,18 @@ static int create_recv_sock() {
 
 static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock *sockdata) {
 	int r = -1;
-	int sd = socket(AF_INET, SOCK_DGRAM, 0);
+	int sd;
+	struct ifreq ifr;
+	struct in_addr *if_addr = &((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr;
+	int on = 1;
+	struct sockaddr_in serveraddr;
+	struct ip_mreq mreq;
+	int ttl = 255; // IP TTL should be 255: https://datatracker.ietf.org/doc/html/rfc6762#section-11
+	char *addr_str;
+	char *mask_str;
+	char *net_str;
+
+	sd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (sd < 0) {
 		log_message(LOG_ERR, "send socket(): %s", strerror(errno));
 		r = sd;
@@ -151,10 +162,8 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 	sockdata->ifname = ifname;
 	sockdata->sockfd = sd;
 
-	struct ifreq ifr;
 	memset(&ifr, 0, sizeof(ifr));
 	strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
-	struct in_addr *if_addr = &((struct sockaddr_in *) &ifr.ifr_addr)->sin_addr;
 
 #ifdef SO_BINDTODEVICE
 	if ((r = setsockopt(sd, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(struct ifreq))) < 0) {
@@ -180,14 +189,12 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 	// compute network (address & mask)
 	sockdata->net.s_addr = sockdata->addr.s_addr & sockdata->mask.s_addr;
 
-	int on = 1;
 	if ((r = setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) < 0) {
 		log_message(LOG_ERR, "send setsockopt(SO_REUSEADDR): %s", strerror(errno));
 		goto out;
 	}
 
 	// bind to an address
-	struct sockaddr_in serveraddr;
 	memset(&serveraddr, 0, sizeof(serveraddr));
 	serveraddr.sin_family = AF_INET;
 	serveraddr.sin_port = htons(MDNS_PORT);
@@ -205,7 +212,6 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 #endif
 
 	// add membership to receiving socket
-	struct ip_mreq mreq;
 	memset(&mreq, 0, sizeof(mreq));
 	mreq.imr_interface.s_addr = if_addr->s_addr;
 	mreq.imr_multiaddr.s_addr = inet_addr(MDNS_ADDR);
@@ -220,15 +226,14 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 		goto out;
 	}
 
-	int ttl = 255; // IP TTL should be 255: https://datatracker.ietf.org/doc/html/rfc6762#section-11
 	if ((r = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl))) < 0) {
 		log_message(LOG_ERR, "send setsockopt(IP_MULTICAST_TTL): %s", strerror(errno));
 		goto out;
 	}
 
-	char *addr_str = strdup(inet_ntoa(sockdata->addr));
-	char *mask_str = strdup(inet_ntoa(sockdata->mask));
-	char *net_str  = strdup(inet_ntoa(sockdata->net));
+	addr_str = strdup(inet_ntoa(sockdata->addr));
+	mask_str = strdup(inet_ntoa(sockdata->mask));
+	net_str  = strdup(inet_ntoa(sockdata->net));
 	log_message(LOG_INFO, "dev %s addr %s mask %s net %s", ifr.ifr_name, addr_str, mask_str, net_str);
 	free(addr_str);
 	free(mask_str);
