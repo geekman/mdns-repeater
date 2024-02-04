@@ -380,42 +380,54 @@ static void show_help(const char *progname) {
 		);
 }
 
-int parse(char *input, struct subnet *s) {
+static bool
+parse_subnet(const char *input, struct subnet *s) {
+	bool r = false;
 	int delim = 0;
 	int end = 0;
-	while (input[end] != 0) {
-		if (input[end] == '/') {
+	char *addr = NULL;
+	int mask;
+
+	while (input[end] != '\0') {
+		if (input[end] == '/')
 			delim = end;
-		}
 		end++;
 	}
 
 	if (end == 0 || delim == 0 || end == delim) {
-		return -1;
+		log_message(LOG_ERR, "invalid blacklist/whitelist argument: %s", input);
+		goto out;
 	}
 
-	char *addr = (char*) malloc(end);
+	addr = malloc(end);
+	if (!addr) {
+		log_message(LOG_ERR, "malloc(): %s", strerror(errno));
+		goto out;
+	}
 
 	memset(addr, 0, end);
 	strncpy(addr, input, delim);
 	if (inet_pton(AF_INET, addr, &s->addr) != 1) {
-		free(addr);
-		return -2;
+		log_message(LOG_ERR, "could not parse blacklist/whitelist netmask: %s", input);
+		goto out;
 	}
 
 	memset(addr, 0, end);
 	strncpy(addr, input+delim+1, end-delim-1);
-	int mask = atoi(addr);
-	free(addr);
+	mask = atoi(addr);
 
 	if (mask < 0 || mask > 32) {
-		return -3;
+		log_message(LOG_ERR, "invalid blacklist/whitelist netmask: %s", input);
+		goto out;
 	}
 
 	s->mask.s_addr = ntohl((uint32_t)0xFFFFFFFF << (32 - mask));
 	s->net.s_addr = s->addr.s_addr & s->mask.s_addr;
+	r = true;
 
-	return 0;
+out:
+	free(addr);
+	return r;
 }
 
 int tostring(struct subnet *s, char* buf, int len) {
@@ -431,7 +443,7 @@ int tostring(struct subnet *s, char* buf, int len) {
 }
 
 static int parse_opts(int argc, char *argv[]) {
-	int c, res;
+	int c;
 	bool help = false;
 	struct subnet *ss;
 	char *msg;
@@ -465,19 +477,8 @@ static int parse_opts(int argc, char *argv[]) {
 				}
 
 				ss = &blacklisted_subnets[num_blacklisted_subnets];
-				res = parse(optarg, ss);
-				switch (res) {
-					case -1:
-						log_message(LOG_ERR, "invalid blacklist argument");
-						exit(2);
-					case -2:
-						log_message(LOG_ERR, "could not parse netmask");
-						exit(2);
-					case -3:
-						log_message(LOG_ERR, "invalid netmask");
-						exit(2);
-				}
-
+				if (!parse_subnet(optarg, ss))
+					exit(2);
 				num_blacklisted_subnets++;
 
 				msg = malloc(128);
@@ -498,19 +499,8 @@ static int parse_opts(int argc, char *argv[]) {
 				}
 
 				ss = &whitelisted_subnets[num_whitelisted_subnets];
-				res = parse(optarg, ss);
-				switch (res) {
-					case -1:
-						log_message(LOG_ERR, "invalid whitelist argument");
-						exit(2);
-					case -2:
-						log_message(LOG_ERR, "could not parse netmask");
-						exit(2);
-					case -3:
-						log_message(LOG_ERR, "invalid netmask");
-						exit(2);
-				}
-
+				if (!parse_subnet(optarg, ss))
+					exit(2);
 				num_whitelisted_subnets++;
 
 				msg = malloc(128);
