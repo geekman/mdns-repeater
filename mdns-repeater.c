@@ -71,7 +71,10 @@ int server_sockfd = -1;
 void *pkt_data = NULL;
 
 bool foreground = false;
-bool shutdown_flag = false;
+
+int signal_pipe_fds[2];
+#define PIPE_RD 0
+#define PIPE_WR 1
 
 char *pid_file = PIDFILE;
 
@@ -283,9 +286,9 @@ static ssize_t send_packet(int fd, const void *data, size_t len) {
 	return sendto(fd, data, len, 0, (struct sockaddr *) &toaddr, sizeof(struct sockaddr_in));
 }
 
-static void mdns_repeater_shutdown(int sig) {
-	(void)sig;
-	shutdown_flag = true;
+static void
+signal_shutdown(int sig) {
+	write(signal_pipe_fds[PIPE_WR], &sig, 1);
 }
 
 static pid_t already_running() {
@@ -335,7 +338,7 @@ static void daemonize() {
 	// signals
 	signal(SIGCHLD, SIG_IGN);
 	signal(SIGHUP, SIG_IGN);
-	signal(SIGTERM, mdns_repeater_shutdown);
+	signal(SIGTERM, signal_shutdown);
 
 	setsid();
 	umask(0027);
@@ -546,6 +549,12 @@ int main(int argc, char *argv[]) {
 
 	openlog(PACKAGE, LOG_PID | LOG_CONS, LOG_DAEMON);
 
+	// create signal pipe pair
+	if (pipe(signal_pipe_fds) < 0) {
+		log_message(LOG_ERR, "pipe(): %s", strerror(errno));
+		goto end_main;
+	}
+
 	// create receiving socket
 	server_sockfd = create_recv_sock();
 	if (server_sockfd < 0) {
@@ -588,7 +597,7 @@ int main(int argc, char *argv[]) {
 		goto end_main;
 	}
 
-	while (!shutdown_flag) {
+	while (true) {
 		struct timeval tv = {
 			.tv_sec = 10,
 			.tv_usec = 0,
@@ -596,9 +605,14 @@ int main(int argc, char *argv[]) {
 
 		FD_ZERO(&sockfd_set);
 		FD_SET(server_sockfd, &sockfd_set);
+		FD_SET(signal_pipe_fds[PIPE_RD], &sockfd_set);
+
 		int numfd = select(server_sockfd + 1, &sockfd_set, NULL, NULL, &tv);
 		if (numfd <= 0)
 			continue;
+
+		if (FD_ISSET(signal_pipe_fds[PIPE_RD], &sockfd_set))
+			break;
 
 		if (FD_ISSET(server_sockfd, &sockfd_set)) {
 			struct sockaddr_in fromaddr;
