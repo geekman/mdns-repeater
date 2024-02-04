@@ -93,6 +93,38 @@ void log_message(int loglevel, char *fmt_str, ...) {
 	}
 }
 
+static char *
+addr_mask_net_to_string(struct in_addr *addr, struct in_addr *mask,
+			struct in_addr *net) {
+	const char *fmt = "addr %s mask %s net %s";
+	/* sizeof(fmt) = some extra bytes, and it's compile-time constant */
+	static char msg[sizeof(fmt) + 3 * INET6_ADDRSTRLEN];
+	char addrbuf[INET6_ADDRSTRLEN];
+	char maskbuf[INET6_ADDRSTRLEN];
+	char netbuf[INET6_ADDRSTRLEN];
+
+	snprintf(msg, sizeof(msg), fmt,
+		 inet_ntop(AF_INET, addr, addrbuf, sizeof(addrbuf)),
+		 inet_ntop(AF_INET, mask, maskbuf, sizeof(maskbuf)),
+		 inet_ntop(AF_INET, net, netbuf, sizeof(netbuf)));
+
+	return msg;
+}
+
+static char *
+if_sock_to_string(struct if_sock *sock) {
+	return addr_mask_net_to_string(&sock->addr,
+				       &sock->mask,
+				       &sock->net);
+}
+
+static char *
+subnet_to_string(struct subnet *subnet) {
+	return addr_mask_net_to_string(&subnet->addr,
+				       &subnet->mask,
+				       &subnet->net);
+}
+
 static int create_recv_sock() {
 	int sd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (sd < 0) {
@@ -145,9 +177,6 @@ create_send_sock(int recv_sockfd, const char *ifname) {
 	struct sockaddr_in serveraddr;
 	struct ip_mreq mreq;
 	int ttl = 255; // IP TTL should be 255: https://datatracker.ietf.org/doc/html/rfc6762#section-11
-	char *addr_str;
-	char *mask_str;
-	char *net_str;
 
 	sockdata = malloc(sizeof(*sockdata));
 	if (!sockdata) {
@@ -233,14 +262,7 @@ create_send_sock(int recv_sockfd, const char *ifname) {
 		goto out;
 	}
 
-	addr_str = strdup(inet_ntoa(sockdata->addr));
-	mask_str = strdup(inet_ntoa(sockdata->mask));
-	net_str  = strdup(inet_ntoa(sockdata->net));
-	log_message(LOG_INFO, "dev %s addr %s mask %s net %s", ifr.ifr_name, addr_str, mask_str, net_str);
-	free(addr_str);
-	free(mask_str);
-	free(net_str);
-
+	log_message(LOG_INFO, "dev %s %s", ifr.ifr_name, if_sock_to_string(sockdata));
 	return sockdata;
 
 out:
@@ -437,23 +459,10 @@ subnet_match(struct sockaddr_in *fromaddr, struct list_head *subnets)
 	return false;
 }
 
-int tostring(struct subnet *s, char* buf, int len) {
-	char *addr_str = strdup(inet_ntoa(s->addr));
-	char *mask_str = strdup(inet_ntoa(s->mask));
-	char *net_str = strdup(inet_ntoa(s->net));
-	int l = snprintf(buf, len, "addr %s mask %s net %s", addr_str, mask_str, net_str);
-	free(addr_str);
-	free(mask_str);
-	free(net_str);
-
-	return l;
-}
-
 static int parse_opts(int argc, char *argv[]) {
 	int c;
 	bool help = false;
 	struct subnet *subnet;
-	char *msg;
 
 	while ((c = getopt(argc, argv, "hfp:b:w:u:")) != -1) {
 		switch (c) {
@@ -477,12 +486,7 @@ static int parse_opts(int argc, char *argv[]) {
 				if (!subnet)
 					exit(2);
 				list_add(&subnet->list, &blacklisted_subnets);
-
-				msg = malloc(128);
-				memset(msg, 0, 128);
-				tostring(subnet, msg, 128);
-				log_message(LOG_INFO, "blacklist %s", msg);
-				free(msg);
+				log_message(LOG_INFO, "blacklist %s", subnet_to_string(subnet));
 				break;
 
 			case 'w':
@@ -490,12 +494,7 @@ static int parse_opts(int argc, char *argv[]) {
 				if (!subnet)
 					exit(2);
 				list_add(&subnet->list, &whitelisted_subnets);
-
-				msg = malloc(128);
-				memset(msg, 0, 128);
-				tostring(subnet, msg, 128);
-				log_message(LOG_INFO, "whitelist %s", msg);
-				free(msg);
+				log_message(LOG_INFO, "whitelist %s", subnet_to_string(subnet));
 				break;
 
 			case '?':
