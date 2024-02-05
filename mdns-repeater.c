@@ -40,7 +40,8 @@
 #include "list.h"
 
 #define PACKAGE "mdns-repeater"
-#define MDNS_ADDR "224.0.0.251"
+#define MDNS_ADDR4 "224.0.0.251"
+#define MDNS_ADDR6 "FF02::FB"
 #define MDNS_PORT 5353
 
 #ifndef PIDFILE
@@ -64,6 +65,11 @@ struct recv_sock {
 	const char *name;			/* name of this socket  */
 	int sockfd;				/* socket fd            */
 	char pkt_data[PACKET_SIZE];		/* incoming packet data */
+	union {
+		struct sockaddr_storage addr;	/* socket addr		*/
+		struct sockaddr_in6 addr_in6;	/* socket addr (IPv6)	*/
+		struct sockaddr_in addr_in;	/* socket addr (IPv4)	*/
+	};
 	union {
 		struct sockaddr_storage from;	/* sender addr		*/
 		struct sockaddr_in6 from_in6;	/* sender addr (IPv6)	*/
@@ -186,11 +192,57 @@ subnet_to_string(struct subnet *subnet) {
 }
 
 static struct recv_sock *
-create_recv_sock() {
+create_recv_sock6() {
 	struct recv_sock *sock;
 	int sd;
 	int on = 1;
-	struct sockaddr_in serveraddr;
+
+	sock = malloc(sizeof(*sock));
+	if (!sock) {
+		log_message(LOG_ERR, "malloc(): %s", strerror(errno));
+		goto out;
+	}
+
+	sd = socket(AF_INET6, SOCK_DGRAM, 0);
+	if (sd < 0) {
+		log_message(LOG_ERR, "recv socket6(): %s", strerror(errno));
+		goto out;
+	}
+	sock->sockfd = sd;
+
+	if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
+		log_message(LOG_ERR, "recv setsockopt6(SO_REUSEADDR): %s", strerror(errno));
+		goto out;
+	}
+
+	// enable loopback in case someone else needs the data
+	if (setsockopt(sd, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, &on, sizeof(on)) < 0) {
+		log_message(LOG_ERR, "recv setsockopt6(IP_MULTICAST_LOOP): %s", strerror(errno));
+		goto out;
+	}
+
+	/* bind to an address */
+	memset(&sock->addr, 0, sizeof(sock->addr));
+	sock->addr_in6.sin6_family = AF_INET6;
+	sock->addr_in6.sin6_port = htons(MDNS_PORT);
+	sock->addr_in6.sin6_addr = in6addr_any;
+	if (bind(sd, (struct sockaddr *)&sock->addr_in6, sizeof(sock->addr_in6)) < 0) {
+		log_message(LOG_ERR, "recv bind6(): %s", strerror(errno));
+		goto out;
+	}
+
+	return sock;
+
+out:
+	free(sock);
+	return NULL;
+}
+
+static struct recv_sock *
+create_recv_sock4() {
+	struct recv_sock *sock;
+	int sd;
+	int on = 1;
 
 	sock = malloc(sizeof(*sock));
 	if (!sock) {
@@ -211,11 +263,11 @@ create_recv_sock() {
 	}
 
 	/* bind to an address */
-	memset(&serveraddr, 0, sizeof(serveraddr));
-	serveraddr.sin_family = AF_INET;
-	serveraddr.sin_port = htons(MDNS_PORT);
-	serveraddr.sin_addr.s_addr = htonl(INADDR_ANY);	/* receive multicast */
-	if (bind(sd, (struct sockaddr *)&serveraddr, sizeof(serveraddr)) < 0) {
+	memset(&sock->addr, 0, sizeof(sock->addr));
+	sock->addr_in.sin_family = AF_INET;
+	sock->addr_in.sin_port = htons(MDNS_PORT);
+	sock->addr_in.sin_addr.s_addr = htonl(INADDR_ANY);
+	if (bind(sd, (struct sockaddr *)&sock->addr_in, sizeof(sock->addr_in)) < 0) {
 		log_message(LOG_ERR, "recv bind(): %s", strerror(errno));
 		goto out;
 	}
@@ -249,6 +301,7 @@ create_send_sock(const char *ifname, struct list_head *recv_socks) {
 	int on = 1;
 	struct sockaddr_in serveraddr;
 	struct recv_sock *recv_sock;
+	struct ipv6_mreq mreq6;
 	struct ip_mreq mreq;
 	int ttl = 255; // IP TTL should be 255: https://datatracker.ietf.org/doc/html/rfc6762#section-11
 
@@ -319,12 +372,27 @@ create_send_sock(const char *ifname, struct list_head *recv_socks) {
 	// add membership to receiving sockets
 	memset(&mreq, 0, sizeof(mreq));
 	mreq.imr_interface.s_addr = if_addr->s_addr;
-	mreq.imr_multiaddr.s_addr = inet_addr(MDNS_ADDR);
+	mreq.imr_multiaddr.s_addr = inet_addr(MDNS_ADDR4);
+	memset(&mreq6, 0, sizeof(mreq6));
+	inet_pton(AF_INET6, MDNS_ADDR6, &mreq6.ipv6mr_multiaddr.s6_addr);
+	mreq6.ipv6mr_interface = if_nametoindex(ifname);
+
 	list_for_each_entry(recv_sock, recv_socks, list) {
-		if (setsockopt(recv_sock->sockfd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
-			       &mreq, sizeof(mreq)) < 0) {
-			log_message(LOG_ERR, "recv setsockopt(IP_ADD_MEMBERSHIP): %s", strerror(errno));
-			goto out;
+		switch (recv_sock->addr.ss_family) {
+		case AF_INET6:
+			if (setsockopt(recv_sock->sockfd, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP,
+				       &mreq6, sizeof(mreq6)) < 0) {
+				log_message(LOG_ERR, "recv setsockopt6(IPV6_ADD_MEMBERSHIP): %s", strerror(errno));
+				goto out;
+			}
+			break;
+		case AF_INET:
+			if (setsockopt(recv_sock->sockfd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+				       &mreq, sizeof(mreq)) < 0) {
+				log_message(LOG_ERR, "recv setsockopt4(IP_ADD_MEMBERSHIP): %s", strerror(errno));
+				goto out;
+			}
+			break;
 		}
 	}
 
@@ -354,7 +422,7 @@ static ssize_t send_packet(int fd, const void *data, size_t len) {
 		memset(&toaddr, 0, sizeof(struct sockaddr_in));
 		toaddr.sin_family = AF_INET;
 		toaddr.sin_port = htons(MDNS_PORT);
-		toaddr.sin_addr.s_addr = inet_addr(MDNS_ADDR);
+		toaddr.sin_addr.s_addr = inet_addr(MDNS_ADDR4);
 	}
 
 	return sendto(fd, data, len, 0, (struct sockaddr *) &toaddr, sizeof(struct sockaddr_in));
@@ -674,9 +742,18 @@ int main(int argc, char *argv[]) {
 	pfds_count++;
 
 	// create receiving sockets
-	recv_sock = create_recv_sock();
+	recv_sock = create_recv_sock6();
 	if (!recv_sock) {
-		log_message(LOG_ERR, "unable to create server socket");
+		log_message(LOG_ERR, "unable to create server IPv6 socket");
+		r = 1;
+		goto end_main;
+	}
+	list_add(&recv_sock->list, &recv_socks);
+	pfds_count++;
+
+	recv_sock = create_recv_sock4();
+	if (!recv_sock) {
+		log_message(LOG_ERR, "unable to create server IPv4 socket");
 		r = 1;
 		goto end_main;
 	}
@@ -780,6 +857,8 @@ int main(int argc, char *argv[]) {
 					       recv_sock->from_str,
 					       sizeof(recv_sock->from_str)))
 					recv_sock->from_str[0] = '\0';
+				printf("skipping v6 packet from=%s size=%zd\n",
+				       recv_sock->from_str, recvsize);
 				/* Not supported yet */
 				continue;
 			default:
