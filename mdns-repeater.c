@@ -878,6 +878,39 @@ repeat_packet6(struct recv_sock *recv_sock)
 	printf("skipping v6 packet from=%s size=%zd\n", recv_sock->from_str, recv_sock->pkt_size);
 }
 
+static void
+recv_packet(struct recv_sock *recv_sock)
+{
+	socklen_t sockaddr_size = sizeof(recv_sock->from);
+
+	recv_sock->pkt_size = recvfrom(recv_sock->sockfd,
+				       recv_sock->pkt_data,
+				       sizeof(recv_sock->pkt_data), 0,
+				       (struct sockaddr *)&recv_sock->from,
+				       &sockaddr_size);
+	if (recv_sock->pkt_size < 0)
+		return;
+
+	switch (recv_sock->from.ss_family) {
+	case AF_INET:
+		if (!inet_ntop(AF_INET,
+			       &recv_sock->from_in.sin_addr,
+			       recv_sock->from_str,
+			       sizeof(recv_sock->from_str)))
+			recv_sock->from_str[0] = '\0';
+		repeat_packet4(recv_sock);
+		break;
+	case AF_INET6:
+		if (!inet_ntop(AF_INET6,
+			       &recv_sock->from_in6.sin6_addr,
+			       recv_sock->from_str,
+			       sizeof(recv_sock->from_str)))
+			recv_sock->from_str[0] = '\0';
+		repeat_packet6(recv_sock);
+		break;
+	}
+}
+
 int main(int argc, char *argv[]) {
 	pid_t running_pid;
 	int r = 0;
@@ -988,52 +1021,15 @@ int main(int argc, char *argv[]) {
 			break;
 
 		for (int i = 1; i < pfds_used; i++) {
-			socklen_t sockaddr_size;
-
 			if (!(pfds[i].revents & POLLIN))
 				continue;
 
-			recv_sock = NULL;
-			list_for_each_entry(tmp_recv_sock, &recv_socks, list) {
-				if (tmp_recv_sock->sockfd == pfds[i].fd) {
-					recv_sock = tmp_recv_sock;
+			list_for_each_entry(recv_sock, &recv_socks, list) {
+				if (recv_sock->sockfd == pfds[i].fd) {
+					recv_packet(recv_sock);
 					break;
 				}
 			}
-
-			if (!recv_sock)
-				continue;
-
-			sockaddr_size = sizeof(recv_sock->from);
-			recv_sock->pkt_size = recvfrom(recv_sock->sockfd,
-						       recv_sock->pkt_data,
-						       sizeof(recv_sock->pkt_data), 0,
-						       (struct sockaddr *)&recv_sock->from,
-						       &sockaddr_size);
-			if (recv_sock->pkt_size < 0)
-				continue;
-
-			switch (recv_sock->from.ss_family) {
-			case AF_INET:
-				if (!inet_ntop(AF_INET,
-					       &recv_sock->from_in.sin_addr,
-					       recv_sock->from_str,
-					       sizeof(recv_sock->from_str)))
-					recv_sock->from_str[0] = '\0';
-				repeat_packet4(recv_sock);
-				break;
-			case AF_INET6:
-				if (!inet_ntop(AF_INET6,
-					       &recv_sock->from_in6.sin6_addr,
-					       recv_sock->from_str,
-					       sizeof(recv_sock->from_str)))
-					recv_sock->from_str[0] = '\0';
-				repeat_packet6(recv_sock);
-				continue;
-			default:
-				continue;
-			}
-
 		}
 	}
 
