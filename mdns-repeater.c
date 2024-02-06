@@ -309,14 +309,110 @@ out:
 }
 
 static struct send_sock *
-create_send_sock(const char *ifname, struct list_head *recv_socks) {
+create_send_sock6(const char *ifname, struct list_head *recv_socks) {
+	struct send_sock *sock = NULL;
+	int sd = -1;
+	int ifindex;
+	int on = 1;
+	int ttl = 255; // https://datatracker.ietf.org/doc/html/rfc6762#section-11
+	struct ipv6_mreq mreq6;
+	struct recv_sock *recv_sock;
+
+	ifindex = if_nametoindex (ifname);
+	if (ifindex < 1) {
+		log_message(LOG_ERR, "if_nametoindex(%s): %s", ifname, strerror(errno));
+		goto out;
+	}
+
+	sock = malloc(sizeof(*sock));
+	if (!sock) {
+		log_message(LOG_ERR, "malloc(): %s", strerror(errno));
+		goto out;
+	}
+	memset(sock, 0, sizeof(*sock));
+	sock->ifname = ifname;
+
+	sd = socket(AF_INET6, SOCK_DGRAM, 0);
+	if (sd < 0) {
+		log_message(LOG_ERR, "send socket6(): %s", strerror(errno));
+		goto out;
+	}
+	sock->sockfd = sd;
+
+	// FIXME: get a list of addresses and routes for the interface
+
+	sock->addr.ss_family = AF_INET6;
+	sock->addr_in.sin_port = htons(MDNS_PORT);
+
+	// make sure that the socket uses only IPv6
+	if (setsockopt(sd, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on)) < 0) {
+		log_message(LOG_ERR, "send setsockopt(IPV6_V6ONLY): %s", strerror(errno));
+		goto out;
+	}
+
+	// make sure that the address can be used by other applications
+	if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
+		log_message(LOG_ERR, "send setsockopt6(SO_REUSEADDR): %s", strerror(errno));
+		goto out;
+	}
+
+	// bind to the address
+	if (bind(sd, (struct sockaddr *)&sock->addr_in6, sizeof(sock->addr_in6)) < 0) {
+		log_message(LOG_ERR, "send bind6(): %s", strerror(errno));
+		goto out;
+	}
+
+	// bind to the device
+	if (setsockopt(sd, IPPROTO_IPV6, IPV6_MULTICAST_IF, &ifindex, sizeof(ifindex)) < 0) {
+		log_message(LOG_ERR, "send setsockopt(IPV6_MULTICAST_IF): %s", strerror(errno));
+		goto out;
+	}
+
+	// enable loopback in case someone else needs the data
+	if (setsockopt(sd, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, &on, sizeof(on)) < 0) {
+		log_message(LOG_ERR, "send setsockopt(IPV6_MULTICAST_LOOP): %s", strerror(errno));
+		goto out;
+	}
+
+	// set the TTL per RFC6762
+	if (setsockopt(sd, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &ttl, sizeof(ttl)) < 0) {
+		log_message(LOG_ERR, "send setsockopt(IPV6_MULTICAST_HOPS): %s", strerror(errno));
+		goto out;
+	}
+
+	// add membership to receiving sockets
+	memset(&mreq6, 0, sizeof(mreq6));
+	inet_pton(AF_INET6, MDNS_ADDR6, &mreq6.ipv6mr_multiaddr.s6_addr);
+	mreq6.ipv6mr_interface = ifindex;
+
+	list_for_each_entry(recv_sock, recv_socks, list) {
+		if (recv_sock->addr.ss_family != AF_INET6)
+			continue;
+
+		if (setsockopt(recv_sock->sockfd, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP,
+			       &mreq6, sizeof(mreq6)) < 0) {
+			log_message(LOG_ERR, "recv setsockopt(IPV6_ADD_MEMBERSHIP): %s", strerror(errno));
+			goto out;
+		}
+	}
+
+	log_message(LOG_INFO, "dev %s %s", sock->ifname, send_sock_to_string(sock));
+	return sock;
+
+out:
+	free(sock);
+	close(sd);
+	return NULL;
+}
+
+static struct send_sock *
+create_send_sock4(const char *ifname, struct list_head *recv_socks) {
 	struct send_sock *sock;
 	int sd = -1;
 	struct ifreq ifr;
 	struct in_addr *if_addr = &((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr;
 	int on = 1;
 	int ttl = 255; // https://datatracker.ietf.org/doc/html/rfc6762#section-11
-	struct ipv6_mreq mreq6;
 	struct ip_mreq mreq;
 	struct recv_sock *recv_sock;
 
@@ -330,7 +426,7 @@ create_send_sock(const char *ifname, struct list_head *recv_socks) {
 
 	sd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (sd < 0) {
-		log_message(LOG_ERR, "send socket(): %s", strerror(errno));
+		log_message(LOG_ERR, "send socket4(): %s", strerror(errno));
 		goto out;
 	}
 	sock->sockfd = sd;
@@ -358,19 +454,19 @@ create_send_sock(const char *ifname, struct list_head *recv_socks) {
 
 	// make sure that the address can be used by other applications
 	if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
-		log_message(LOG_ERR, "send setsockopt(SO_REUSEADDR): %s", strerror(errno));
+		log_message(LOG_ERR, "send setsockopt4(SO_REUSEADDR): %s", strerror(errno));
 		goto out;
 	}
 
 	// bind to the address
 	if (bind(sd, (struct sockaddr *)&sock->addr_in, sizeof(sock->addr_in)) < 0) {
-		log_message(LOG_ERR, "send bind(): %s", strerror(errno));
+		log_message(LOG_ERR, "send bind4(): %s", strerror(errno));
 		goto out;
 	}
 
 	// bind to the device
 	if (setsockopt(sd, IPPROTO_IP, IP_MULTICAST_IF, &sock->addr_in.sin_addr, sizeof(sock->addr_in)) < 0) {
-		log_message(LOG_ERR, "send ip_multicast_if(): %s", strerror(errno));
+		log_message(LOG_ERR, "send setsockopt(IP_MULTICAST_IF): %s", strerror(errno));
 		goto out;
 	}
 
@@ -390,30 +486,19 @@ create_send_sock(const char *ifname, struct list_head *recv_socks) {
 	memset(&mreq, 0, sizeof(mreq));
 	mreq.imr_interface.s_addr = if_addr->s_addr;
 	mreq.imr_multiaddr.s_addr = inet_addr(MDNS_ADDR4);
-	memset(&mreq6, 0, sizeof(mreq6));
-	inet_pton(AF_INET6, MDNS_ADDR6, &mreq6.ipv6mr_multiaddr.s6_addr);
-	mreq6.ipv6mr_interface = if_nametoindex(ifname);
 
 	list_for_each_entry(recv_sock, recv_socks, list) {
-		switch (recv_sock->addr.ss_family) {
-		case AF_INET6:
-			if (setsockopt(recv_sock->sockfd, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP,
-				       &mreq6, sizeof(mreq6)) < 0) {
-				log_message(LOG_ERR, "recv setsockopt6(IPV6_ADD_MEMBERSHIP): %s", strerror(errno));
-				goto out;
-			}
-			break;
-		case AF_INET:
-			if (setsockopt(recv_sock->sockfd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
-				       &mreq, sizeof(mreq)) < 0) {
-				log_message(LOG_ERR, "recv setsockopt4(IP_ADD_MEMBERSHIP): %s", strerror(errno));
-				goto out;
-			}
-			break;
+		if (recv_sock->addr.ss_family != AF_INET)
+			continue;
+
+		if (setsockopt(recv_sock->sockfd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+			       &mreq, sizeof(mreq)) < 0) {
+			log_message(LOG_ERR, "recv setsockopt(IP_ADD_MEMBERSHIP): %s", strerror(errno));
+			goto out;
 		}
 	}
 
-	log_message(LOG_INFO, "dev %s %s", ifr.ifr_name, send_sock_to_string(sock));
+	log_message(LOG_INFO, "dev %s %s", sock->ifname, send_sock_to_string(sock));
 	return sock;
 
 out:
@@ -747,7 +832,7 @@ int main(int argc, char *argv[]) {
 	}
 	pfds_count++;
 
-	// create receiving sockets
+	// create receiving IPv6 sockets
 	recv_sock = create_recv_sock6();
 	if (!recv_sock) {
 		log_message(LOG_ERR, "unable to create server IPv6 socket");
@@ -757,6 +842,7 @@ int main(int argc, char *argv[]) {
 	list_add(&recv_sock->list, &recv_socks);
 	pfds_count++;
 
+	// create receiving IPv4 sockets
 	recv_sock = create_recv_sock4();
 	if (!recv_sock) {
 		log_message(LOG_ERR, "unable to create server IPv4 socket");
@@ -766,15 +852,25 @@ int main(int argc, char *argv[]) {
 	list_add(&recv_sock->list, &recv_socks);
 	pfds_count++;
 
-	// create sending sockets
+	// create sending IPv6 sockets
 	for (int i = optind; i < argc; i++) {
-		send_sock = create_send_sock(argv[i], &recv_socks);
+		send_sock = create_send_sock6(argv[i], &recv_socks);
 		if (!send_sock) {
-			log_message(LOG_ERR, "unable to create socket for interface %s", argv[i]);
+			log_message(LOG_ERR, "unable to create IPv6 socket for interface %s", argv[i]);
 			r = 1;
 			goto end_main;
 		}
+		list_add(&send_sock->list, &send_socks);
+	}
 
+	// create sending IPv4 sockets
+	for (int i = optind; i < argc; i++) {
+		send_sock = create_send_sock4(argv[i], &recv_socks);
+		if (!send_sock) {
+			log_message(LOG_ERR, "unable to create IPv4 socket for interface %s", argv[i]);
+			r = 1;
+			goto end_main;
+		}
 		list_add(&send_sock->list, &send_socks);
 	}
 
