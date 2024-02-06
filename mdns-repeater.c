@@ -68,7 +68,8 @@ struct send_sock {
 	};
 	struct list_head list;			/* socket list		*/
 };
-LIST_HEAD(send_socks);
+LIST_HEAD(send_socks6);
+LIST_HEAD(send_socks4);
 
 #define PACKET_SIZE 65536
 struct recv_sock {
@@ -868,7 +869,7 @@ int main(int argc, char *argv[]) {
 			r = 1;
 			goto end_main;
 		}
-		list_add(&send_sock->list, &send_socks);
+		list_add(&send_sock->list, &send_socks6);
 	}
 
 	// create sending IPv4 sockets
@@ -879,7 +880,7 @@ int main(int argc, char *argv[]) {
 			r = 1;
 			goto end_main;
 		}
-		list_add(&send_sock->list, &send_socks);
+		list_add(&send_sock->list, &send_socks4);
 	}
 
 	if (user) {
@@ -949,7 +950,6 @@ int main(int argc, char *argv[]) {
 					    (struct sockaddr *)&recv_sock->from,
 					    &sockaddr_size);
 			if (recvsize < 0) {
-				log_message(LOG_ERR, "recv(): %s", strerror(errno));
 				continue;
 			}
 
@@ -960,6 +960,8 @@ int main(int argc, char *argv[]) {
 					       recv_sock->from_str,
 					       sizeof(recv_sock->from_str)))
 					recv_sock->from_str[0] = '\0';
+				printf("got v4 packet from=%s size=%zd\n",
+				       recv_sock->from_str, recvsize);
 				break;
 			case AF_INET6:
 				if (!inet_ntop(AF_INET6,
@@ -975,7 +977,7 @@ int main(int argc, char *argv[]) {
 				continue;
 			}
 
-			list_for_each_entry(send_sock, &send_socks, list) {
+			list_for_each_entry(send_sock, &send_socks4, list) {
 				// make sure packet originated from specified networks
 				if ((recv_sock->from_in.sin_addr.s_addr & send_sock->mask_in.s_addr) == send_sock->net_in.s_addr) {
 					our_net = true;
@@ -1010,7 +1012,7 @@ int main(int argc, char *argv[]) {
 				printf("data from=%s size=%zd\n",
 				       recv_sock->from_str, recvsize);
 
-			list_for_each_entry(send_sock, &send_socks, list) {
+			list_for_each_entry(send_sock, &send_socks4, list) {
 				ssize_t sentsize;
 
 				// do not repeat packet back to the same network from which it originated
@@ -1042,7 +1044,13 @@ end_main:
 		free(recv_sock);
 	}
 
-	list_for_each_entry_safe(send_sock, tmp_send_sock, &send_socks, list) {
+	list_for_each_entry_safe(send_sock, tmp_send_sock, &send_socks6, list) {
+		list_del(&send_sock->list);
+		close(send_sock->sockfd);
+		free(send_sock);
+	}
+
+	list_for_each_entry_safe(send_sock, tmp_send_sock, &send_socks4, list) {
 		list_del(&send_sock->list);
 		close(send_sock->sockfd);
 		free(send_sock);
