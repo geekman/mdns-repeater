@@ -303,7 +303,7 @@ create_send_sock(const char *ifname, struct list_head *recv_socks) {
 	struct recv_sock *recv_sock;
 	struct ipv6_mreq mreq6;
 	struct ip_mreq mreq;
-	int ttl = 255; // IP TTL should be 255: https://datatracker.ietf.org/doc/html/rfc6762#section-11
+	int ttl = 255; // https://datatracker.ietf.org/doc/html/rfc6762#section-11
 
 	sockdata = malloc(sizeof(*sockdata));
 	if (!sockdata) {
@@ -322,13 +322,6 @@ create_send_sock(const char *ifname, struct list_head *recv_socks) {
 
 	memset(&ifr, 0, sizeof(ifr));
 	strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
-
-#ifdef SO_BINDTODEVICE
-	if (setsockopt(sd, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(struct ifreq)) < 0) {
-		log_message(LOG_ERR, "send setsockopt(SO_BINDTODEVICE): %s", strerror(errno));
-		goto out;
-	}
-#endif
 
 	// get netmask
 	if (ioctl(sd, SIOCGIFNETMASK, &ifr) < 0) {
@@ -352,22 +345,35 @@ create_send_sock(const char *ifname, struct list_head *recv_socks) {
 		goto out;
 	}
 
-	// bind to an address
+	// record the address to use
 	memset(&serveraddr, 0, sizeof(serveraddr));
 	serveraddr.sin_family = AF_INET;
 	serveraddr.sin_port = htons(MDNS_PORT);
 	serveraddr.sin_addr.s_addr = if_addr->s_addr;
+
+	// bind to an address
 	if (bind(sd, (struct sockaddr *)&serveraddr, sizeof(serveraddr)) < 0) {
 		log_message(LOG_ERR, "send bind(): %s", strerror(errno));
 		goto out;
 	}
 
-#if __FreeBSD__
+	// bind to a device
 	if (setsockopt(sd, IPPROTO_IP, IP_MULTICAST_IF, &serveraddr.sin_addr, sizeof(serveraddr.sin_addr)) < 0) {
 		log_message(LOG_ERR, "send ip_multicast_if(): %s", strerror(errno));
 		goto out;
 	}
-#endif
+
+	// enable loopback in case someone else needs the data
+	if (setsockopt(sd, IPPROTO_IP, IP_MULTICAST_LOOP, &on, sizeof(on)) < 0) {
+		log_message(LOG_ERR, "send setsockopt(IP_MULTICAST_LOOP): %s", strerror(errno));
+		goto out;
+	}
+
+	// set the TTL per RFC6762
+	if (setsockopt(sd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl)) < 0) {
+		log_message(LOG_ERR, "send setsockopt(IP_MULTICAST_TTL): %s", strerror(errno));
+		goto out;
+	}
 
 	// add membership to receiving sockets
 	memset(&mreq, 0, sizeof(mreq));
@@ -394,17 +400,6 @@ create_send_sock(const char *ifname, struct list_head *recv_socks) {
 			}
 			break;
 		}
-	}
-
-	// enable loopback in case someone else needs the data
-	if (setsockopt(sd, IPPROTO_IP, IP_MULTICAST_LOOP, &on, sizeof(on)) < 0) {
-		log_message(LOG_ERR, "send setsockopt(IP_MULTICAST_LOOP): %s", strerror(errno));
-		goto out;
-	}
-
-	if (setsockopt(sd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl)) < 0) {
-		log_message(LOG_ERR, "send setsockopt(IP_MULTICAST_TTL): %s", strerror(errno));
-		goto out;
 	}
 
 	log_message(LOG_INFO, "dev %s %s", ifr.ifr_name, send_sock_to_string(sockdata));
