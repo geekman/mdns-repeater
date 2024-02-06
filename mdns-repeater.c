@@ -65,7 +65,10 @@ struct addr_mask {
 	union sockaddr_u addr;			/* socket addr		*/
 	union in_addr_u mask;			/* socket mask		*/
 	union in_addr_u net;			/* socket net		*/
+	struct list_head list;			/* addr_mask list	*/
 };
+LIST_HEAD(blacklisted_subnets);
+LIST_HEAD(whitelisted_subnets);
 
 struct send_sock {
 	const char *ifname;			/* interface name	*/
@@ -88,13 +91,6 @@ struct recv_sock {
 	struct list_head list;			/* socket list          */
 };
 LIST_HEAD(recv_socks);
-
-struct subnet {
-	struct addr_mask am;			/* subnet addr/mask/net	*/
-	struct list_head list;			/* subnet list		*/
-};
-LIST_HEAD(blacklisted_subnets);
-LIST_HEAD(whitelisted_subnets);
 
 bool foreground = false;
 
@@ -618,9 +614,9 @@ static void show_help(const char *progname) {
  *   192.168.0.12/24
  *   2001:db8::/32
  */
-static struct subnet *
+static struct addr_mask *
 parse_subnet(const char *input) {
-	struct subnet *subnet;
+	struct addr_mask *subnet;
 	char *addr_str = NULL;
 	char *delim;
 	struct in6_addr *addr_in6;
@@ -654,8 +650,8 @@ parse_subnet(const char *input) {
 		goto out;
 	}
 
-	addr_in6 = &subnet->am.addr.sin6.sin6_addr;
-	addr_in = &subnet->am.addr.sin.sin_addr;
+	addr_in6 = &subnet->addr.sin6.sin6_addr;
+	addr_in = &subnet->addr.sin.sin_addr;
 
 	// First, try parsing an IPv6 address
 	if (inet_pton(AF_INET6, addr_str, addr_in6) == 1) {
@@ -667,11 +663,11 @@ parse_subnet(const char *input) {
 		for (int i = 0; i < sizeof(addr_in6->s6_addr); i++) {
 			uint8_t mask = 0xff << (8 - MIN(prefix_len, 8));
 			prefix_len -= MIN(prefix_len, 8);
-			subnet->am.mask.in6.s6_addr[i] = mask;
-			subnet->am.net.in6.s6_addr[i] = addr_in6->s6_addr[i] & mask;
+			subnet->mask.in6.s6_addr[i] = mask;
+			subnet->net.in6.s6_addr[i] = addr_in6->s6_addr[i] & mask;
 		}
 
-		subnet->am.addr.ss.ss_family = AF_INET6;
+		subnet->addr.ss.ss_family = AF_INET6;
 
 	// Second, try parsing an IPv4 address
 	} else if (inet_pton(AF_INET, addr_str, addr_in) == 1) {
@@ -680,9 +676,9 @@ parse_subnet(const char *input) {
 			goto out;
 		}
 
-		subnet->am.mask.in.s_addr = ntohl(0xFFFFFFFF << (32 - prefix_len));
-		subnet->am.net.in.s_addr = addr_in->s_addr & subnet->am.mask.in.s_addr;
-		subnet->am.addr.ss.ss_family = AF_INET;
+		subnet->mask.in.s_addr = ntohl(0xFFFFFFFF << (32 - prefix_len));
+		subnet->net.in.s_addr = addr_in->s_addr & subnet->mask.in.s_addr;
+		subnet->addr.ss.ss_family = AF_INET;
 
 	// Give up
 	} else {
@@ -702,13 +698,13 @@ out:
 static bool
 subnet_match(struct sockaddr_in *fromaddr, struct list_head *subnets)
 {
-	struct subnet *subnet;
+	struct addr_mask *subnet;
 
 	list_for_each_entry(subnet, subnets, list) {
-		if (subnet->am.addr.ss.ss_family != AF_INET)
+		if (subnet->addr.ss.ss_family != AF_INET)
 			continue;
 
-		if ((fromaddr->sin_addr.s_addr & subnet->am.mask.in.s_addr) == subnet->am.net.in.s_addr)
+		if ((fromaddr->sin_addr.s_addr & subnet->mask.in.s_addr) == subnet->net.in.s_addr)
 			return true;
 	}
 
@@ -718,7 +714,7 @@ subnet_match(struct sockaddr_in *fromaddr, struct list_head *subnets)
 static int parse_opts(int argc, char *argv[]) {
 	int c;
 	bool help = false;
-	struct subnet *subnet;
+	struct addr_mask *subnet;
 
 	while ((c = getopt(argc, argv, "hfp:b:w:u:")) != -1) {
 		switch (c) {
@@ -742,7 +738,7 @@ static int parse_opts(int argc, char *argv[]) {
 				if (!subnet)
 					exit(2);
 				list_add(&subnet->list, &blacklisted_subnets);
-				log_message(LOG_INFO, "blacklist %s", addr_mask_to_string(&subnet->am));
+				log_message(LOG_INFO, "blacklist %s", addr_mask_to_string(subnet));
 				break;
 
 			case 'w':
@@ -750,7 +746,7 @@ static int parse_opts(int argc, char *argv[]) {
 				if (!subnet)
 					exit(2);
 				list_add(&subnet->list, &whitelisted_subnets);
-				log_message(LOG_INFO, "whitelist %s", addr_mask_to_string(&subnet->am));
+				log_message(LOG_INFO, "whitelist %s", addr_mask_to_string(subnet));
 				break;
 
 			case '?':
@@ -886,7 +882,7 @@ int main(int argc, char *argv[]) {
 	int r = 0;
 	struct send_sock *send_sock, *tmp_send_sock;
 	struct recv_sock *recv_sock, *tmp_recv_sock;
-	struct subnet *subnet, *tmp_subnet;
+	struct addr_mask *subnet, *tmp_subnet;
 	int pfds_count = 0;
 	int pfds_used = 0;
 	struct pollfd *pfds;
