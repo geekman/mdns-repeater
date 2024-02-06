@@ -903,7 +903,7 @@ repeat_packet6(struct recv_sock *recv_sock)
 }
 
 static void
-recv_packet(struct recv_sock *recv_sock)
+recv_packet6(struct recv_sock *recv_sock)
 {
 	socklen_t sockaddr_size = sizeof(recv_sock->from);
 
@@ -915,22 +915,44 @@ recv_packet(struct recv_sock *recv_sock)
 	if (recv_sock->pkt_size < 0)
 		return;
 
-	switch (recv_sock->from.ss.ss_family) {
+	if (!inet_ntop(AF_INET6,
+		       &recv_sock->from.sin6.sin6_addr,
+		       recv_sock->from_str,
+		       sizeof(recv_sock->from_str)))
+		recv_sock->from_str[0] = '\0';
+	repeat_packet6(recv_sock);
+}
+
+static void
+recv_packet4(struct recv_sock *recv_sock)
+{
+	socklen_t sockaddr_size = sizeof(recv_sock->from);
+
+	recv_sock->pkt_size = recvfrom(recv_sock->sockfd,
+				       recv_sock->pkt_data,
+				       sizeof(recv_sock->pkt_data), 0,
+				       (struct sockaddr *)&recv_sock->from,
+				       &sockaddr_size);
+	if (recv_sock->pkt_size < 0)
+		return;
+
+	if (!inet_ntop(AF_INET,
+		       &recv_sock->from.sin.sin_addr,
+		       recv_sock->from_str,
+		       sizeof(recv_sock->from_str)))
+		recv_sock->from_str[0] = '\0';
+	repeat_packet4(recv_sock);
+}
+
+static void
+recv_packet(struct recv_sock *recv_sock)
+{
+	switch (recv_sock->addr.ss.ss_family) {
 	case AF_INET:
-		if (!inet_ntop(AF_INET,
-			       &recv_sock->from.sin.sin_addr,
-			       recv_sock->from_str,
-			       sizeof(recv_sock->from_str)))
-			recv_sock->from_str[0] = '\0';
-		repeat_packet4(recv_sock);
+		recv_packet4(recv_sock);
 		break;
 	case AF_INET6:
-		if (!inet_ntop(AF_INET6,
-			       &recv_sock->from.sin6.sin6_addr,
-			       recv_sock->from_str,
-			       sizeof(recv_sock->from_str)))
-			recv_sock->from_str[0] = '\0';
-		repeat_packet6(recv_sock);
+		recv_packet6(recv_sock);
 		break;
 	}
 }
