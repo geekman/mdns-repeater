@@ -51,12 +51,22 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 struct send_sock {
-	const char *ifname;	/* interface name  */
-	int sockfd;		/* socket filedesc */
-	struct in_addr addr;	/* interface addr  */
-	struct in_addr mask;	/* interface mask  */
-	struct in_addr net;	/* interface network (computed) */
-	struct list_head list;	/* socket list     */
+	const char *ifname;			/* interface name	*/
+	int sockfd;				/* socket fd		*/
+	union {
+		struct sockaddr_storage addr;	/* socket addr		*/
+		struct sockaddr_in6 addr_in6;	/* socket addr (IPv6)	*/
+		struct sockaddr_in addr_in;	/* socket addr (IPv4)	*/
+	};
+	union {
+		struct in6_addr mask_in6;	/* socket mask (IPv6)	*/
+		struct in_addr mask_in;		/* socket mask (IPv4)	*/
+	};
+	union {
+		struct in6_addr net_in6;	/* socket net (IPv6)	*/
+		struct in_addr net_in;		/* socket net (IPv4)	*/
+	};
+	struct list_head list;			/* socket list		*/
 };
 LIST_HEAD(send_socks);
 
@@ -167,12 +177,18 @@ addr4_mask_net_to_string(struct sockaddr_in *addr,
 
 static char *
 send_sock_to_string(struct send_sock *sock) {
-	struct sockaddr_storage addr;
-	struct sockaddr_in *addr_in = (struct sockaddr_in *)&addr;
-
-	addr.ss_family = AF_INET;
-	memcpy(&addr_in->sin_addr, &sock->addr, sizeof(addr_in->sin_addr));
-	return addr4_mask_net_to_string(addr_in, &sock->mask, &sock->net);
+	switch (sock->addr.ss_family) {
+	case AF_INET6:
+		return addr6_mask_net_to_string(&sock->addr_in6,
+						&sock->mask_in6,
+						&sock->net_in6);
+	case AF_INET:
+		return addr4_mask_net_to_string(&sock->addr_in,
+						&sock->mask_in,
+						&sock->net_in);
+	default:
+		return "ERROR";
+	}
 }
 
 static char *
@@ -294,71 +310,66 @@ out:
 
 static struct send_sock *
 create_send_sock(const char *ifname, struct list_head *recv_socks) {
-	struct send_sock *sockdata;
+	struct send_sock *sock;
 	int sd = -1;
 	struct ifreq ifr;
 	struct in_addr *if_addr = &((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr;
 	int on = 1;
-	struct sockaddr_in serveraddr;
-	struct recv_sock *recv_sock;
+	int ttl = 255; // https://datatracker.ietf.org/doc/html/rfc6762#section-11
 	struct ipv6_mreq mreq6;
 	struct ip_mreq mreq;
-	int ttl = 255; // https://datatracker.ietf.org/doc/html/rfc6762#section-11
+	struct recv_sock *recv_sock;
 
-	sockdata = malloc(sizeof(*sockdata));
-	if (!sockdata) {
+	sock = malloc(sizeof(*sock));
+	if (!sock) {
 		log_message(LOG_ERR, "malloc(): %s", strerror(errno));
 		goto out;
 	}
+	memset(sock, 0, sizeof(*sock));
+	sock->ifname = ifname;
 
 	sd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (sd < 0) {
 		log_message(LOG_ERR, "send socket(): %s", strerror(errno));
 		goto out;
 	}
-
-	sockdata->ifname = ifname;
-	sockdata->sockfd = sd;
-
-	memset(&ifr, 0, sizeof(ifr));
-	strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
+	sock->sockfd = sd;
 
 	// get netmask
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
 	if (ioctl(sd, SIOCGIFNETMASK, &ifr) < 0) {
 		log_message(LOG_ERR, "ioctl(SIOCGIFNETMASK): %s", strerror(errno));
 		goto out;
 	}
-	memcpy(&sockdata->mask, if_addr, sizeof(*if_addr));
+	memcpy(&sock->mask_in, if_addr, sizeof(*if_addr));
 
-	// .. and interface address
+	// ...and interface address
 	if (ioctl(sd, SIOCGIFADDR, &ifr) < 0) {
 		log_message(LOG_ERR, "ioctl(SIOCGIFADDR): %s", strerror(errno));
 		goto out;
 	}
-	memcpy(&sockdata->addr, if_addr, sizeof(*if_addr));
+	memcpy(&sock->addr_in.sin_addr, if_addr, sizeof(*if_addr));
+	sock->addr.ss_family = AF_INET;
+	sock->addr_in.sin_port = htons(MDNS_PORT);
 
-	// compute network (address & mask)
-	sockdata->net.s_addr = sockdata->addr.s_addr & sockdata->mask.s_addr;
+	// ...then compute the network
+	sock->net_in.s_addr = sock->addr_in.sin_addr.s_addr & sock->mask_in.s_addr;
 
+	// make sure that the address can be used by other applications
 	if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
 		log_message(LOG_ERR, "send setsockopt(SO_REUSEADDR): %s", strerror(errno));
 		goto out;
 	}
 
-	// record the address to use
-	memset(&serveraddr, 0, sizeof(serveraddr));
-	serveraddr.sin_family = AF_INET;
-	serveraddr.sin_port = htons(MDNS_PORT);
-	serveraddr.sin_addr.s_addr = if_addr->s_addr;
-
-	// bind to an address
-	if (bind(sd, (struct sockaddr *)&serveraddr, sizeof(serveraddr)) < 0) {
+	// bind to the address
+	if (bind(sd, (struct sockaddr *)&sock->addr_in, sizeof(sock->addr_in)) < 0) {
 		log_message(LOG_ERR, "send bind(): %s", strerror(errno));
 		goto out;
 	}
 
-	// bind to a device
-	if (setsockopt(sd, IPPROTO_IP, IP_MULTICAST_IF, &serveraddr.sin_addr, sizeof(serveraddr.sin_addr)) < 0) {
+	// bind to the device
+	if (setsockopt(sd, IPPROTO_IP, IP_MULTICAST_IF, &sock->addr_in.sin_addr, sizeof(sock->addr_in)) < 0) {
 		log_message(LOG_ERR, "send ip_multicast_if(): %s", strerror(errno));
 		goto out;
 	}
@@ -402,11 +413,11 @@ create_send_sock(const char *ifname, struct list_head *recv_socks) {
 		}
 	}
 
-	log_message(LOG_INFO, "dev %s %s", ifr.ifr_name, send_sock_to_string(sockdata));
-	return sockdata;
+	log_message(LOG_INFO, "dev %s %s", ifr.ifr_name, send_sock_to_string(sock));
+	return sock;
 
 out:
-	free(sockdata);
+	free(sock);
 	close(sd);
 	return NULL;
 }
@@ -862,12 +873,12 @@ int main(int argc, char *argv[]) {
 
 			list_for_each_entry(send_sock, &send_socks, list) {
 				// make sure packet originated from specified networks
-				if ((recv_sock->from_in.sin_addr.s_addr & send_sock->mask.s_addr) == send_sock->net.s_addr) {
+				if ((recv_sock->from_in.sin_addr.s_addr & send_sock->mask_in.s_addr) == send_sock->net_in.s_addr) {
 					our_net = true;
 				}
 
 				// check for loopback
-				if (recv_sock->from_in.sin_addr.s_addr == send_sock->addr.s_addr) {
+				if (recv_sock->from_in.sin_addr.s_addr == send_sock->addr_in.sin_addr.s_addr) {
 					discard = true;
 					break;
 				}
@@ -899,7 +910,7 @@ int main(int argc, char *argv[]) {
 				ssize_t sentsize;
 
 				// do not repeat packet back to the same network from which it originated
-				if ((recv_sock->from_in.sin_addr.s_addr & send_sock->mask.s_addr) == send_sock->net.s_addr)
+				if ((recv_sock->from_in.sin_addr.s_addr & send_sock->mask_in.s_addr) == send_sock->net_in.s_addr)
 					continue;
 
 				if (foreground)
