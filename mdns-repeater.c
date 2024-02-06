@@ -70,13 +70,20 @@ struct addr_mask {
 LIST_HEAD(blacklisted_subnets);
 LIST_HEAD(whitelisted_subnets);
 
-struct send_sock {
+struct send_sock6 {
 	const char *ifname;			/* interface name	*/
 	int sockfd;				/* socket fd		*/
 	struct addr_mask am;			/* socket addr/mask/net	*/
 	struct list_head list;			/* socket list		*/
 };
 LIST_HEAD(send_socks6);
+
+struct send_sock4 {
+	const char *ifname;			/* interface name	*/
+	int sockfd;				/* socket fd		*/
+	struct addr_mask am;			/* socket addr/mask/net	*/
+	struct list_head list;			/* socket list		*/
+};
 LIST_HEAD(send_socks4);
 
 #define PACKET_SIZE 65536
@@ -284,9 +291,9 @@ out:
 	return NULL;
 }
 
-static struct send_sock *
+static struct send_sock6 *
 create_send_sock6(const char *ifname, struct list_head *recv_socks) {
-	struct send_sock *sock = NULL;
+	struct send_sock6 *sock = NULL;
 	int sd = -1;
 	int ifindex;
 	int on = 1;
@@ -381,9 +388,9 @@ out:
 	return NULL;
 }
 
-static struct send_sock *
+static struct send_sock4 *
 create_send_sock4(const char *ifname, struct list_head *recv_socks) {
-	struct send_sock *sock;
+	struct send_sock4 *sock;
 	int sd = -1;
 	struct ifreq ifr;
 	struct in_addr *if_addr = &((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr;
@@ -783,7 +790,7 @@ static int parse_opts(int argc, char *argv[]) {
 
 static void
 repeat_packet4(struct recv_sock *recv_sock) {
-	struct send_sock *send_sock;
+	struct send_sock4 *send_sock;
 	bool our_net = false;
 	ssize_t sentsize;
 
@@ -880,7 +887,8 @@ recv_packet(struct recv_sock *recv_sock)
 int main(int argc, char *argv[]) {
 	pid_t running_pid;
 	int r = 0;
-	struct send_sock *send_sock, *tmp_send_sock;
+	struct send_sock6 *send_sock6, *tmp_send_sock6;
+	struct send_sock4 *send_sock4, *tmp_send_sock4;
 	struct recv_sock *recv_sock, *tmp_recv_sock;
 	struct addr_mask *subnet, *tmp_subnet;
 	int pfds_count = 0;
@@ -926,24 +934,24 @@ int main(int argc, char *argv[]) {
 
 	// create sending IPv6 sockets
 	for (int i = optind; i < argc; i++) {
-		send_sock = create_send_sock6(argv[i], &recv_socks);
-		if (!send_sock) {
+		send_sock6 = create_send_sock6(argv[i], &recv_socks);
+		if (!send_sock6) {
 			log_message(LOG_ERR, "unable to create IPv6 socket for interface %s", argv[i]);
 			r = 1;
 			goto end_main;
 		}
-		list_add(&send_sock->list, &send_socks6);
+		list_add(&send_sock6->list, &send_socks6);
 	}
 
 	// create sending IPv4 sockets
 	for (int i = optind; i < argc; i++) {
-		send_sock = create_send_sock4(argv[i], &recv_socks);
-		if (!send_sock) {
+		send_sock4 = create_send_sock4(argv[i], &recv_socks);
+		if (!send_sock4) {
 			log_message(LOG_ERR, "unable to create IPv4 socket for interface %s", argv[i]);
 			r = 1;
 			goto end_main;
 		}
-		list_add(&send_sock->list, &send_socks4);
+		list_add(&send_sock4->list, &send_socks4);
 	}
 
 	if (user) {
@@ -1008,16 +1016,16 @@ end_main:
 		free(recv_sock);
 	}
 
-	list_for_each_entry_safe(send_sock, tmp_send_sock, &send_socks6, list) {
-		list_del(&send_sock->list);
-		close(send_sock->sockfd);
-		free(send_sock);
+	list_for_each_entry_safe(send_sock6, tmp_send_sock6, &send_socks6, list) {
+		list_del(&send_sock6->list);
+		close(send_sock6->sockfd);
+		free(send_sock6);
 	}
 
-	list_for_each_entry_safe(send_sock, tmp_send_sock, &send_socks4, list) {
-		list_del(&send_sock->list);
-		close(send_sock->sockfd);
-		free(send_sock);
+	list_for_each_entry_safe(send_sock4, tmp_send_sock4, &send_socks4, list) {
+		list_del(&send_sock4->list);
+		close(send_sock4->sockfd);
+		free(send_sock4);
 	}
 
 	list_for_each_entry_safe(subnet, tmp_subnet, &blacklisted_subnets, list) {
