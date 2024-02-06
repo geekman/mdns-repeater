@@ -226,6 +226,13 @@ create_recv_sock6() {
 	}
 	sock->sockfd = sd;
 
+	// make sure that the socket uses only IPv6
+	if (setsockopt(sd, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on)) < 0) {
+		log_message(LOG_ERR, "send setsockopt(IPV6_V6ONLY): %s", strerror(errno));
+		goto out;
+	}
+
+	// make sure that the address can be used by other applications
 	if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
 		log_message(LOG_ERR, "recv setsockopt6(SO_REUSEADDR): %s", strerror(errno));
 		goto out;
@@ -233,11 +240,11 @@ create_recv_sock6() {
 
 	// enable loopback in case someone else needs the data
 	if (setsockopt(sd, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, &on, sizeof(on)) < 0) {
-		log_message(LOG_ERR, "recv setsockopt6(IP_MULTICAST_LOOP): %s", strerror(errno));
+		log_message(LOG_ERR, "recv setsockopt(IPV6_MULTICAST_LOOP): %s", strerror(errno));
 		goto out;
 	}
 
-	/* bind to an address */
+	// bind to an address
 	memset(&sock->addr, 0, sizeof(sock->addr));
 	sock->addr_in6.sin6_family = AF_INET6;
 	sock->addr_in6.sin6_port = htons(MDNS_PORT);
@@ -273,12 +280,13 @@ create_recv_sock4() {
 	}
 	sock->sockfd = sd;
 
+	// make sure that the address can be used by other applications
 	if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
 		log_message(LOG_ERR, "recv setsockopt(SO_REUSEADDR): %s", strerror(errno));
 		goto out;
 	}
 
-	/* bind to an address */
+	// bind to an address
 	memset(&sock->addr, 0, sizeof(sock->addr));
 	sock->addr_in.sin_family = AF_INET;
 	sock->addr_in.sin_port = htons(MDNS_PORT);
