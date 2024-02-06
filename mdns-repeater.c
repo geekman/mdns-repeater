@@ -51,6 +51,11 @@
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
+struct _in6_pktinfo {
+	struct in6_addr ipi6_addr;    /* src/dst IPv6 address */
+	unsigned int    ipi6_ifindex; /* send/recv interface index */
+};
+
 union sockaddr_u {
 	struct sockaddr_storage ss;		/* socket addr		*/
 	struct sockaddr_in6 sin6;		/* socket addr (IPv6)	*/
@@ -217,6 +222,12 @@ create_recv_sock6() {
 	// enable loopback in case someone else needs the data
 	if (setsockopt(sd, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, &on, sizeof(on)) < 0) {
 		log_message(LOG_ERR, "recv setsockopt(IPV6_MULTICAST_LOOP): %s", strerror(errno));
+		goto out;
+	}
+
+	// provides info on which interface a packet arrived via
+	if (setsockopt(sd, IPPROTO_IPV6, IPV6_RECVPKTINFO,  &on, sizeof(on)) < 0) {
+		log_message(LOG_ERR, "recv setsockopt(IPV6_RECVPKTINFO): %s", strerror(errno));
 		goto out;
 	}
 
@@ -896,23 +907,58 @@ repeat_packet4(struct recv_sock *recv_sock) {
 }
 
 static void
-repeat_packet6(struct recv_sock *recv_sock)
+repeat_packet6(struct recv_sock *recv_sock, unsigned ifindex)
 {
 	// Not implemented yet
-	printf("skipping v6 packet from=%s size=%zd\n", recv_sock->from_str, recv_sock->pkt_size);
+	printf("skipping v6 packet from=%s ifindex=%u size=%zd\n",
+	       recv_sock->from_str, ifindex, recv_sock->pkt_size);
 }
 
 static void
 recv_packet6(struct recv_sock *recv_sock)
 {
-	socklen_t sockaddr_size = sizeof(recv_sock->from);
+	uint8_t cmsgbuf[1024];
+	struct iovec iov[] = {
+		{
+			.iov_base = &recv_sock->pkt_data,
+			.iov_len = sizeof(recv_sock->pkt_data),
+		}
+	};
+	struct msghdr msg = {
+		.msg_name = &recv_sock->from,
+		.msg_namelen = sizeof(recv_sock->from),
+		.msg_iov = iov,
+		.msg_iovlen = 1,
+		.msg_control = cmsgbuf,
+		.msg_controllen = sizeof(cmsgbuf),
+		.msg_flags = 0,
+	};
+	struct cmsghdr *chdr;
+	struct _in6_pktinfo *pktinfo = NULL;
 
-	recv_sock->pkt_size = recvfrom(recv_sock->sockfd,
-				       recv_sock->pkt_data,
-				       sizeof(recv_sock->pkt_data), 0,
-				       (struct sockaddr *)&recv_sock->from,
-				       &sockaddr_size);
+	recv_sock->pkt_size = recvmsg(recv_sock->sockfd, &msg, 0);
 	if (recv_sock->pkt_size < 0)
+		return;
+	else if (msg.msg_flags & MSG_TRUNC)
+		return;
+	else if (msg.msg_flags & MSG_CTRUNC)
+		return;
+
+	for (chdr = CMSG_FIRSTHDR(&msg); chdr; chdr = CMSG_NXTHDR(&msg, chdr)) {
+		printf("Got a hdr: lvl %i and type %i\n",
+		       chdr->cmsg_level, chdr->cmsg_type);
+
+		if (chdr->cmsg_level != IPPROTO_IPV6)
+			continue;
+
+		if (chdr->cmsg_type != IPV6_PKTINFO)
+			continue;
+
+		pktinfo = (struct _in6_pktinfo *)CMSG_DATA(chdr);
+		break;
+        }
+
+	if (!pktinfo)
 		return;
 
 	if (!inet_ntop(AF_INET6,
@@ -920,7 +966,7 @@ recv_packet6(struct recv_sock *recv_sock)
 		       recv_sock->from_str,
 		       sizeof(recv_sock->from_str)))
 		recv_sock->from_str[0] = '\0';
-	repeat_packet6(recv_sock);
+	repeat_packet6(recv_sock, pktinfo->ipi6_ifindex);
 }
 
 static void
