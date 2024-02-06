@@ -73,7 +73,7 @@ LIST_HEAD(whitelisted_subnets);
 struct send_sock6 {
 	const char *ifname;			/* interface name	*/
 	int sockfd;				/* socket fd		*/
-	struct addr_mask am;			/* socket addr/mask/net	*/
+	struct list_head ams;			/* socket addr/mask/nets*/
 	struct list_head list;			/* socket list		*/
 };
 LIST_HEAD(send_socks6);
@@ -294,6 +294,7 @@ out:
 static struct send_sock6 *
 create_send_sock6(const char *ifname, struct list_head *recv_socks) {
 	struct send_sock6 *sock = NULL;
+	struct addr_mask *am, *tmp_am;
 	int sd = -1;
 	int ifindex;
 	int on = 1;
@@ -313,7 +314,17 @@ create_send_sock6(const char *ifname, struct list_head *recv_socks) {
 		goto out;
 	}
 	memset(sock, 0, sizeof(*sock));
+	INIT_LIST_HEAD(&sock->ams);
 	sock->ifname = ifname;
+
+	// FIXME: get a list of addresses and routes for the interface
+	am = malloc(sizeof(*am));
+	if (!am) {
+		log_message(LOG_ERR, "malloc(): %s", strerror(errno));
+		goto out;
+	}
+	am->addr.ss.ss_family = AF_INET6;
+	am->addr.sin.sin_port = htons(MDNS_PORT);
 
 	sd = socket(AF_INET6, SOCK_DGRAM, 0);
 	if (sd < 0) {
@@ -321,11 +332,6 @@ create_send_sock6(const char *ifname, struct list_head *recv_socks) {
 		goto out;
 	}
 	sock->sockfd = sd;
-
-	// FIXME: get a list of addresses and routes for the interface
-
-	sock->am.addr.ss.ss_family = AF_INET6;
-	sock->am.addr.sin.sin_port = htons(MDNS_PORT);
 
 	// make sure that the socket uses only IPv6
 	if (setsockopt(sd, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on)) < 0) {
@@ -340,7 +346,7 @@ create_send_sock6(const char *ifname, struct list_head *recv_socks) {
 	}
 
 	// bind to the address
-	if (bind(sd, (struct sockaddr *)&sock->am.addr.sin6, sizeof(sock->am.addr.sin6)) < 0) {
+	if (bind(sd, (struct sockaddr *)&am->addr.sin6, sizeof(am->addr.sin6)) < 0) {
 		log_message(LOG_ERR, "send bind6(): %s", strerror(errno));
 		goto out;
 	}
@@ -379,11 +385,17 @@ create_send_sock6(const char *ifname, struct list_head *recv_socks) {
 		}
 	}
 
-	log_message(LOG_INFO, "dev %s %s", sock->ifname, addr_mask_to_string(&sock->am));
+	log_message(LOG_INFO, "dev %s %s", sock->ifname, addr_mask_to_string(am));
 	return sock;
 
 out:
-	free(sock);
+	if (sock) {
+		list_for_each_entry_safe(am, tmp_am, &sock->ams, list) {
+			list_del(&am->list);
+			free(am);
+		}
+		free(sock);
+	}
 	close(sd);
 	return NULL;
 }
@@ -890,7 +902,7 @@ int main(int argc, char *argv[]) {
 	struct send_sock6 *send_sock6, *tmp_send_sock6;
 	struct send_sock4 *send_sock4, *tmp_send_sock4;
 	struct recv_sock *recv_sock, *tmp_recv_sock;
-	struct addr_mask *subnet, *tmp_subnet;
+	struct addr_mask *am, *tmp_am;
 	int pfds_count = 0;
 	int pfds_used = 0;
 	struct pollfd *pfds;
@@ -1017,6 +1029,10 @@ end_main:
 	}
 
 	list_for_each_entry_safe(send_sock6, tmp_send_sock6, &send_socks6, list) {
+		list_for_each_entry_safe(am, tmp_am, &send_sock6->ams, list) {
+			list_del(&am->list);
+			free(am);
+		}
 		list_del(&send_sock6->list);
 		close(send_sock6->sockfd);
 		free(send_sock6);
@@ -1028,14 +1044,14 @@ end_main:
 		free(send_sock4);
 	}
 
-	list_for_each_entry_safe(subnet, tmp_subnet, &blacklisted_subnets, list) {
-		list_del(&subnet->list);
-		free(subnet);
+	list_for_each_entry_safe(am, tmp_am, &blacklisted_subnets, list) {
+		list_del(&am->list);
+		free(am);
 	}
 
-	list_for_each_entry_safe(subnet, tmp_subnet, &whitelisted_subnets, list) {
-		list_del(&subnet->list);
-		free(subnet);
+	list_for_each_entry_safe(am, tmp_am, &whitelisted_subnets, list) {
+		list_del(&am->list);
+		free(am);
 	}
 
 	// remove pid file if it belongs to us
