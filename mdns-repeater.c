@@ -50,22 +50,23 @@
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
+union sockaddr_u {
+	struct sockaddr_storage ss;		/* socket addr		*/
+	struct sockaddr_in6 sin6;		/* socket addr (IPv6)	*/
+	struct sockaddr_in sin;			/* socket addr (IPv4)	*/
+};
+
+union in_addr_u {
+	struct in6_addr in6;			/* address (IPv6)	*/
+	struct in_addr in;			/* address (IPv4)	*/
+};
+
 struct send_sock {
 	const char *ifname;			/* interface name	*/
 	int sockfd;				/* socket fd		*/
-	union {
-		struct sockaddr_storage addr;	/* socket addr		*/
-		struct sockaddr_in6 addr_in6;	/* socket addr (IPv6)	*/
-		struct sockaddr_in addr_in;	/* socket addr (IPv4)	*/
-	};
-	union {
-		struct in6_addr mask_in6;	/* socket mask (IPv6)	*/
-		struct in_addr mask_in;		/* socket mask (IPv4)	*/
-	};
-	union {
-		struct in6_addr net_in6;	/* socket net (IPv6)	*/
-		struct in_addr net_in;		/* socket net (IPv4)	*/
-	};
+	union sockaddr_u addr;			/* socket addr		*/
+	union in_addr_u mask;			/* socket mask		*/
+	union in_addr_u net;			/* socket net		*/
 	struct list_head list;			/* socket list		*/
 };
 LIST_HEAD(send_socks6);
@@ -77,35 +78,17 @@ struct recv_sock {
 	int sockfd;				/* socket fd            */
 	char pkt_data[PACKET_SIZE];		/* incoming packet data */
 	ssize_t pkt_size;			/* incoming packet len	*/
-	union {
-		struct sockaddr_storage addr;	/* socket addr		*/
-		struct sockaddr_in6 addr_in6;	/* socket addr (IPv6)	*/
-		struct sockaddr_in addr_in;	/* socket addr (IPv4)	*/
-	};
-	union {
-		struct sockaddr_storage from;	/* sender addr		*/
-		struct sockaddr_in6 from_in6;	/* sender addr (IPv6)	*/
-		struct sockaddr_in from_in;	/* sender addr (IPv4)	*/
-	};
+	union sockaddr_u addr;			/* socket addr		*/
+	union sockaddr_u from;			/* sender addr		*/
 	char from_str[INET6_ADDRSTRLEN];	/* sender addr (str)	*/
 	struct list_head list;			/* socket list          */
 };
 LIST_HEAD(recv_socks);
 
 struct subnet {
-	union {
-		struct sockaddr_storage addr;	/* subnet addr		*/
-		struct sockaddr_in6 addr_in6;	/* subnet addr (IPv6)	*/
-		struct sockaddr_in addr_in;	/* subnet addr (IPv4)	*/
-	};
-	union {
-		struct in6_addr mask_in6;	/* subnet mask (IPv6)	*/
-		struct in_addr mask_in;		/* subnet mask (IPv4)	*/
-	};
-	union {
-		struct in6_addr net_in6;	/* subnet net (IPv6)	*/
-		struct in_addr net_in;		/* subnet net (IPv4)	*/
-	};
+	union sockaddr_u addr;			/* subnet addr		*/
+	union in_addr_u mask;			/* subnet mask		*/
+	union in_addr_u net;			/* subnet net		*/
 	struct list_head list;			/* subnet list		*/
 };
 LIST_HEAD(blacklisted_subnets);
@@ -179,15 +162,15 @@ addr4_mask_net_to_string(struct sockaddr_in *addr,
 
 static char *
 send_sock_to_string(struct send_sock *sock) {
-	switch (sock->addr.ss_family) {
+	switch (sock->addr.ss.ss_family) {
 	case AF_INET6:
-		return addr6_mask_net_to_string(&sock->addr_in6,
-						&sock->mask_in6,
-						&sock->net_in6);
+		return addr6_mask_net_to_string(&sock->addr.sin6,
+						&sock->mask.in6,
+						&sock->net.in6);
 	case AF_INET:
-		return addr4_mask_net_to_string(&sock->addr_in,
-						&sock->mask_in,
-						&sock->net_in);
+		return addr4_mask_net_to_string(&sock->addr.sin,
+						&sock->mask.in,
+						&sock->net.in);
 	default:
 		return "ERROR";
 	}
@@ -195,15 +178,15 @@ send_sock_to_string(struct send_sock *sock) {
 
 static char *
 subnet_to_string(struct subnet *subnet) {
-	switch (subnet->addr.ss_family) {
+	switch (subnet->addr.ss.ss_family) {
 	case AF_INET6:
-		return addr6_mask_net_to_string(&subnet->addr_in6,
-						&subnet->mask_in6,
-						&subnet->net_in6);
+		return addr6_mask_net_to_string(&subnet->addr.sin6,
+						&subnet->mask.in6,
+						&subnet->net.in6);
 	case AF_INET:
-		return addr4_mask_net_to_string(&subnet->addr_in,
-						&subnet->mask_in,
-						&subnet->net_in);
+		return addr4_mask_net_to_string(&subnet->addr.sin,
+						&subnet->mask.in,
+						&subnet->net.in);
 	default:
 		return "ERROR";
 	}
@@ -248,10 +231,10 @@ create_recv_sock6() {
 
 	// bind to an address
 	memset(&sock->addr, 0, sizeof(sock->addr));
-	sock->addr_in6.sin6_family = AF_INET6;
-	sock->addr_in6.sin6_port = htons(MDNS_PORT);
-	sock->addr_in6.sin6_addr = in6addr_any;
-	if (bind(sd, (struct sockaddr *)&sock->addr_in6, sizeof(sock->addr_in6)) < 0) {
+	sock->addr.sin6.sin6_family = AF_INET6;
+	sock->addr.sin6.sin6_port = htons(MDNS_PORT);
+	sock->addr.sin6.sin6_addr = in6addr_any;
+	if (bind(sd, (struct sockaddr *)&sock->addr.sin6, sizeof(sock->addr.sin6)) < 0) {
 		log_message(LOG_ERR, "recv bind6(): %s", strerror(errno));
 		goto out;
 	}
@@ -290,10 +273,10 @@ create_recv_sock4() {
 
 	// bind to an address
 	memset(&sock->addr, 0, sizeof(sock->addr));
-	sock->addr_in.sin_family = AF_INET;
-	sock->addr_in.sin_port = htons(MDNS_PORT);
-	sock->addr_in.sin_addr.s_addr = htonl(INADDR_ANY);
-	if (bind(sd, (struct sockaddr *)&sock->addr_in, sizeof(sock->addr_in)) < 0) {
+	sock->addr.sin.sin_family = AF_INET;
+	sock->addr.sin.sin_port = htons(MDNS_PORT);
+	sock->addr.sin.sin_addr.s_addr = htonl(INADDR_ANY);
+	if (bind(sd, (struct sockaddr *)&sock->addr.sin, sizeof(sock->addr.sin)) < 0) {
 		log_message(LOG_ERR, "recv bind(): %s", strerror(errno));
 		goto out;
 	}
@@ -351,8 +334,8 @@ create_send_sock6(const char *ifname, struct list_head *recv_socks) {
 
 	// FIXME: get a list of addresses and routes for the interface
 
-	sock->addr.ss_family = AF_INET6;
-	sock->addr_in.sin_port = htons(MDNS_PORT);
+	sock->addr.ss.ss_family = AF_INET6;
+	sock->addr.sin.sin_port = htons(MDNS_PORT);
 
 	// make sure that the socket uses only IPv6
 	if (setsockopt(sd, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on)) < 0) {
@@ -367,7 +350,7 @@ create_send_sock6(const char *ifname, struct list_head *recv_socks) {
 	}
 
 	// bind to the address
-	if (bind(sd, (struct sockaddr *)&sock->addr_in6, sizeof(sock->addr_in6)) < 0) {
+	if (bind(sd, (struct sockaddr *)&sock->addr.sin6, sizeof(sock->addr.sin6)) < 0) {
 		log_message(LOG_ERR, "send bind6(): %s", strerror(errno));
 		goto out;
 	}
@@ -396,7 +379,7 @@ create_send_sock6(const char *ifname, struct list_head *recv_socks) {
 	mreq6.ipv6mr_interface = ifindex;
 
 	list_for_each_entry(recv_sock, recv_socks, list) {
-		if (recv_sock->addr.ss_family != AF_INET6)
+		if (recv_sock->addr.ss.ss_family != AF_INET6)
 			continue;
 
 		if (setsockopt(recv_sock->sockfd, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP,
@@ -448,19 +431,19 @@ create_send_sock4(const char *ifname, struct list_head *recv_socks) {
 		log_message(LOG_ERR, "ioctl(SIOCGIFNETMASK): %s", strerror(errno));
 		goto out;
 	}
-	memcpy(&sock->mask_in, if_addr, sizeof(*if_addr));
+	memcpy(&sock->mask.in, if_addr, sizeof(*if_addr));
 
 	// ...and interface address
 	if (ioctl(sd, SIOCGIFADDR, &ifr) < 0) {
 		log_message(LOG_ERR, "ioctl(SIOCGIFADDR): %s", strerror(errno));
 		goto out;
 	}
-	memcpy(&sock->addr_in.sin_addr, if_addr, sizeof(*if_addr));
-	sock->addr.ss_family = AF_INET;
-	sock->addr_in.sin_port = htons(MDNS_PORT);
+	memcpy(&sock->addr.sin.sin_addr, if_addr, sizeof(*if_addr));
+	sock->addr.ss.ss_family = AF_INET;
+	sock->addr.sin.sin_port = htons(MDNS_PORT);
 
 	// ...then compute the network
-	sock->net_in.s_addr = sock->addr_in.sin_addr.s_addr & sock->mask_in.s_addr;
+	sock->net.in.s_addr = sock->addr.sin.sin_addr.s_addr & sock->mask.in.s_addr;
 
 	// make sure that the address can be used by other applications
 	if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
@@ -469,13 +452,13 @@ create_send_sock4(const char *ifname, struct list_head *recv_socks) {
 	}
 
 	// bind to the address
-	if (bind(sd, (struct sockaddr *)&sock->addr_in, sizeof(sock->addr_in)) < 0) {
+	if (bind(sd, (struct sockaddr *)&sock->addr.sin, sizeof(sock->addr.sin)) < 0) {
 		log_message(LOG_ERR, "send bind4(): %s", strerror(errno));
 		goto out;
 	}
 
 	// bind to the device
-	if (setsockopt(sd, IPPROTO_IP, IP_MULTICAST_IF, &sock->addr_in.sin_addr, sizeof(sock->addr_in)) < 0) {
+	if (setsockopt(sd, IPPROTO_IP, IP_MULTICAST_IF, &sock->addr.sin.sin_addr, sizeof(sock->addr.sin)) < 0) {
 		log_message(LOG_ERR, "send setsockopt(IP_MULTICAST_IF): %s", strerror(errno));
 		goto out;
 	}
@@ -498,7 +481,7 @@ create_send_sock4(const char *ifname, struct list_head *recv_socks) {
 	mreq.imr_multiaddr.s_addr = inet_addr(MDNS_ADDR4);
 
 	list_for_each_entry(recv_sock, recv_socks, list) {
-		if (recv_sock->addr.ss_family != AF_INET)
+		if (recv_sock->addr.ss.ss_family != AF_INET)
 			continue;
 
 		if (setsockopt(recv_sock->sockfd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
@@ -684,8 +667,8 @@ parse_subnet(const char *input) {
 		goto out;
 	}
 
-	addr_in6 = &subnet->addr_in6.sin6_addr;
-	addr_in = &subnet->addr_in.sin_addr;
+	addr_in6 = &subnet->addr.sin6.sin6_addr;
+	addr_in = &subnet->addr.sin.sin_addr;
 
 	// First, try parsing an IPv6 address
 	if (inet_pton(AF_INET6, addr_str, addr_in6) == 1) {
@@ -697,11 +680,11 @@ parse_subnet(const char *input) {
 		for (int i = 0; i < sizeof(addr_in6->s6_addr); i++) {
 			uint8_t mask = 0xff << (8 - MIN(prefix_len, 8));
 			prefix_len -= MIN(prefix_len, 8);
-			subnet->mask_in6.s6_addr[i] = mask;
-			subnet->net_in6.s6_addr[i] = addr_in6->s6_addr[i] & mask;
+			subnet->mask.in6.s6_addr[i] = mask;
+			subnet->net.in6.s6_addr[i] = addr_in6->s6_addr[i] & mask;
 		}
 
-		subnet->addr.ss_family = AF_INET6;
+		subnet->addr.ss.ss_family = AF_INET6;
 
 	// Second, try parsing an IPv4 address
 	} else if (inet_pton(AF_INET, addr_str, addr_in) == 1) {
@@ -710,9 +693,9 @@ parse_subnet(const char *input) {
 			goto out;
 		}
 
-		subnet->mask_in.s_addr = ntohl(0xFFFFFFFF << (32 - prefix_len));
-		subnet->net_in.s_addr = addr_in->s_addr & subnet->mask_in.s_addr;
-		subnet->addr.ss_family = AF_INET;
+		subnet->mask.in.s_addr = ntohl(0xFFFFFFFF << (32 - prefix_len));
+		subnet->net.in.s_addr = addr_in->s_addr & subnet->mask.in.s_addr;
+		subnet->addr.ss.ss_family = AF_INET;
 
 	// Give up
 	} else {
@@ -735,10 +718,10 @@ subnet_match(struct sockaddr_in *fromaddr, struct list_head *subnets)
 	struct subnet *subnet;
 
 	list_for_each_entry(subnet, subnets, list) {
-		if (subnet->addr.ss_family != AF_INET)
+		if (subnet->addr.ss.ss_family != AF_INET)
 			continue;
 
-		if ((fromaddr->sin_addr.s_addr & subnet->mask_in.s_addr) == subnet->net_in.s_addr)
+		if ((fromaddr->sin_addr.s_addr & subnet->mask.in.s_addr) == subnet->net.in.s_addr)
 			return true;
 	}
 
@@ -823,12 +806,12 @@ repeat_packet4(struct recv_sock *recv_sock) {
 
 	list_for_each_entry(send_sock, &send_socks4, list) {
 		// make sure packet originated from specified networks
-		if ((recv_sock->from_in.sin_addr.s_addr & send_sock->mask_in.s_addr) == send_sock->net_in.s_addr) {
+		if ((recv_sock->from.sin.sin_addr.s_addr & send_sock->mask.in.s_addr) == send_sock->net.in.s_addr) {
 			our_net = true;
 		}
 
 		// check for loopback
-		if (recv_sock->from_in.sin_addr.s_addr == send_sock->addr_in.sin_addr.s_addr)
+		if (recv_sock->from.sin.sin_addr.s_addr == send_sock->addr.sin.sin_addr.s_addr)
 			return;
 	}
 
@@ -836,14 +819,14 @@ repeat_packet4(struct recv_sock *recv_sock) {
 		return;
 
 	if (!list_empty(&whitelisted_subnets) &&
-	    !subnet_match(&recv_sock->from_in, &whitelisted_subnets)) {
+	    !subnet_match(&recv_sock->from.sin, &whitelisted_subnets)) {
 		if (foreground)
 			printf("skipping packet from=%s size=%zd (not whitelisted)\n",
 			       recv_sock->from_str, recv_sock->pkt_size);
 		return;
 	}
 
-	if (subnet_match(&recv_sock->from_in, &blacklisted_subnets)) {
+	if (subnet_match(&recv_sock->from.sin, &blacklisted_subnets)) {
 		if (foreground)
 			printf("skipping packet from=%s size=%zd (blacklisted)\n",
 			       recv_sock->from_str, recv_sock->pkt_size);
@@ -855,7 +838,7 @@ repeat_packet4(struct recv_sock *recv_sock) {
 
 	list_for_each_entry(send_sock, &send_socks4, list) {
 		// do not repeat packet back to the same network from which it originated
-		if ((recv_sock->from_in.sin_addr.s_addr & send_sock->mask_in.s_addr) == send_sock->net_in.s_addr)
+		if ((recv_sock->from.sin.sin_addr.s_addr & send_sock->mask.in.s_addr) == send_sock->net.in.s_addr)
 			continue;
 
 		if (foreground)
@@ -891,10 +874,10 @@ recv_packet(struct recv_sock *recv_sock)
 	if (recv_sock->pkt_size < 0)
 		return;
 
-	switch (recv_sock->from.ss_family) {
+	switch (recv_sock->from.ss.ss_family) {
 	case AF_INET:
 		if (!inet_ntop(AF_INET,
-			       &recv_sock->from_in.sin_addr,
+			       &recv_sock->from.sin.sin_addr,
 			       recv_sock->from_str,
 			       sizeof(recv_sock->from_str)))
 			recv_sock->from_str[0] = '\0';
@@ -902,7 +885,7 @@ recv_packet(struct recv_sock *recv_sock)
 		break;
 	case AF_INET6:
 		if (!inet_ntop(AF_INET6,
-			       &recv_sock->from_in6.sin6_addr,
+			       &recv_sock->from.sin6.sin6_addr,
 			       recv_sock->from_str,
 			       sizeof(recv_sock->from_str)))
 			recv_sock->from_str[0] = '\0';
