@@ -33,6 +33,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <net/if.h>
+#include <ifaddrs.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <poll.h>
@@ -301,6 +302,8 @@ create_send_sock6(const char *ifname, struct list_head *recv_socks) {
 	int ttl = 255; // https://datatracker.ietf.org/doc/html/rfc6762#section-11
 	struct ipv6_mreq mreq6;
 	struct recv_sock *recv_sock;
+	struct ifaddrs *ifa, *ifap = NULL;
+	struct sockaddr_in6 *bindaddr = NULL;
 
 	ifindex = if_nametoindex (ifname);
 	if (ifindex < 1) {
@@ -317,14 +320,46 @@ create_send_sock6(const char *ifname, struct list_head *recv_socks) {
 	INIT_LIST_HEAD(&sock->ams);
 	sock->ifname = ifname;
 
-	// FIXME: get a list of addresses and routes for the interface
-	am = malloc(sizeof(*am));
-	if (!am) {
-		log_message(LOG_ERR, "malloc(): %s", strerror(errno));
+	if (getifaddrs(&ifap) < 0) {
+		log_message(LOG_ERR, "getifaddrs(): %s", strerror(errno));
 		goto out;
 	}
-	am->addr.ss.ss_family = AF_INET6;
-	am->addr.sin.sin_port = htons(MDNS_PORT);
+
+	for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
+		if (!ifa->ifa_addr)
+			continue;
+		else if (ifa->ifa_addr->sa_family != AF_INET6)
+			continue;
+		else if (!ifa->ifa_netmask)
+			continue;
+		else if (strcmp(ifa->ifa_name, ifname))
+			continue;
+
+		am = malloc(sizeof(*am));
+		if (!am) {
+			log_message(LOG_ERR, "malloc(): %s", strerror(errno));
+			goto out;
+		}
+		memset(am, 0, sizeof(*am));
+
+		am->addr.ss.ss_family = AF_INET6;
+		am->addr.sin6.sin6_port = htons(MDNS_PORT);
+		am->addr.sin6.sin6_addr = ((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr;
+		am->addr.sin6.sin6_scope_id = ifindex;
+		am->mask.in6 = ((struct sockaddr_in6 *)ifa->ifa_netmask)->sin6_addr;
+		for (int i = 0; i < sizeof(am->net.in6.s6_addr); i++)
+		     am->net.in6.s6_addr[i] = am->addr.sin6.sin6_addr.s6_addr[i] &
+					      am->mask.in6.s6_addr[i];
+		list_add(&am->list, &sock->ams);
+
+		if (IN6_IS_ADDR_LINKLOCAL(&am->addr.sin6.sin6_addr))
+			bindaddr = &am->addr.sin6;
+	}
+
+	if (!bindaddr) {
+		log_message(LOG_ERR, "no IPv6 link-local address for dev %s", ifname);
+		goto out;
+	}
 
 	sd = socket(AF_INET6, SOCK_DGRAM, 0);
 	if (sd < 0) {
@@ -346,8 +381,8 @@ create_send_sock6(const char *ifname, struct list_head *recv_socks) {
 	}
 
 	// bind to the address
-	if (bind(sd, (struct sockaddr *)&am->addr.sin6, sizeof(am->addr.sin6)) < 0) {
-		log_message(LOG_ERR, "send bind6(): %s", strerror(errno));
+	if (bind(sd, (struct sockaddr *)bindaddr, sizeof(*bindaddr)) < 0) {
+		log_message(LOG_ERR, "send bind6(): %s %i %i", strerror(errno), errno, EINVAL);
 		goto out;
 	}
 
@@ -385,7 +420,10 @@ create_send_sock6(const char *ifname, struct list_head *recv_socks) {
 		}
 	}
 
-	log_message(LOG_INFO, "dev %s %s", sock->ifname, addr_mask_to_string(am));
+	list_for_each_entry(am, &sock->ams, list)
+		log_message(LOG_INFO, "dev %s %s", sock->ifname, addr_mask_to_string(am));
+
+	freeifaddrs(ifap);
 	return sock;
 
 out:
@@ -397,6 +435,7 @@ out:
 		free(sock);
 	}
 	close(sd);
+	freeifaddrs(ifap);
 	return NULL;
 }
 
