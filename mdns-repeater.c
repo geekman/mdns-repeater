@@ -56,8 +56,8 @@ static const struct in6_addr mdns_addr_in6 = { .s6_addr = {
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 struct _in6_pktinfo {
-	struct in6_addr ipi6_addr;    /* src/dst IPv6 address */
-	unsigned int    ipi6_ifindex; /* send/recv interface index */
+	struct in6_addr ipi6_addr;		/* src/dst IPv6 address	*/
+	unsigned int    ipi6_ifindex;		/* send/recv interface	*/
 };
 
 union sockaddr_u {
@@ -84,7 +84,7 @@ struct send_sock6 {
 	const char *ifname;			/* interface name	*/
 	unsigned ifindex;			/* interface index	*/
 	int sockfd;				/* socket fd		*/
-	struct list_head ams;			/* socket addr/mask/nets*/
+	struct list_head ams;			/* addr/mask/net list	*/
 	struct list_head list;			/* socket list		*/
 };
 LIST_HEAD(send_socks6);
@@ -783,36 +783,36 @@ out:
 }
 
 static bool
-subnet_match6(struct sockaddr_in6 *from, struct list_head *subnets)
+same_network(union sockaddr_u *addr, struct addr_mask *addr_mask)
 {
-	struct addr_mask *subnet;
+	if (addr->ss.ss_family != addr_mask->addr.ss.ss_family)
+		return false;
 
-	list_for_each_entry(subnet, subnets, list) {
-		if (subnet->addr.ss.ss_family != AF_INET6)
-			continue;
-
-		for (int i = 0; i < sizeof(from->sin6_addr); i++)
-			if ((from->sin6_addr.s6_addr[i] & subnet->mask.in6.s6_addr[i]) != subnet->net.in6.s6_addr[i])
-				continue;
-
+	switch (addr->ss.ss_family) {
+	case AF_INET6:
+		for (int i = 0; i < sizeof(addr->sin6.sin6_addr.s6_addr); i++)
+			if ((addr->sin6.sin6_addr.s6_addr[i] &
+			     addr_mask->mask.in6.s6_addr[i])
+			    != addr_mask->net.in6.s6_addr[i])
+				return false;
 		return true;
+	case AF_INET:
+		return ((addr->sin.sin_addr.s_addr &
+			 addr_mask->mask.in.s_addr)
+			== addr_mask->net.in.s_addr);
+	default:
+		return false;
 	}
-
-	return false;
 }
 
 static bool
-subnet_match4(struct sockaddr_in *from, struct list_head *subnets)
+subnet_match(union sockaddr_u *from, struct list_head *subnets)
 {
 	struct addr_mask *subnet;
 
-	list_for_each_entry(subnet, subnets, list) {
-		if (subnet->addr.ss.ss_family != AF_INET)
-			continue;
-
-		if ((from->sin_addr.s_addr & subnet->mask.in.s_addr) == subnet->net.in.s_addr)
+	list_for_each_entry(subnet, subnets, list)
+		if (same_network(from, subnet))
 			return true;
-	}
 
 	return false;
 }
@@ -907,14 +907,14 @@ repeat_packet6(struct recv_sock *recv_sock, unsigned ifindex)
 	}
 
 	if (!list_empty(&whitelisted_subnets) &&
-	    !subnet_match6(&recv_sock->from.sin6, &whitelisted_subnets)) {
+	    !subnet_match(&recv_sock->from, &whitelisted_subnets)) {
 		if (foreground)
 			printf("skipping packet from=%s size=%zd (not whitelisted)\n",
 			       recv_sock->from_str, recv_sock->pkt_size);
 		return;
 	}
 
-	if (subnet_match6(&recv_sock->from.sin6, &blacklisted_subnets)) {
+	if (subnet_match(&recv_sock->from, &blacklisted_subnets)) {
 		if (foreground)
 			printf("skipping packet from=%s size=%zd (blacklisted)\n",
 			       recv_sock->from_str, recv_sock->pkt_size);
@@ -963,14 +963,14 @@ repeat_packet4(struct recv_sock *recv_sock) {
 		return;
 
 	if (!list_empty(&whitelisted_subnets) &&
-	    !subnet_match4(&recv_sock->from.sin, &whitelisted_subnets)) {
+	    !subnet_match(&recv_sock->from, &whitelisted_subnets)) {
 		if (foreground)
 			printf("skipping packet from=%s size=%zd (not whitelisted)\n",
 			       recv_sock->from_str, recv_sock->pkt_size);
 		return;
 	}
 
-	if (subnet_match4(&recv_sock->from.sin, &blacklisted_subnets)) {
+	if (subnet_match(&recv_sock->from, &blacklisted_subnets)) {
 		if (foreground)
 			printf("skipping packet from=%s size=%zd (blacklisted)\n",
 			       recv_sock->from_str, recv_sock->pkt_size);
