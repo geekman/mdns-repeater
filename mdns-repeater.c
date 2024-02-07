@@ -950,9 +950,8 @@ repeat_packet4(struct recv_sock *recv_sock) {
 
 	list_for_each_entry(send_sock, &send_socks4, list) {
 		// make sure packet originated from specified networks
-		if ((recv_sock->from.sin.sin_addr.s_addr & send_sock->am.mask.in.s_addr) == send_sock->am.net.in.s_addr) {
+		if (same_network(&recv_sock->from, &send_sock->am))
 			our_net = true;
-		}
 
 		// check for loopback
 		if (recv_sock->from.sin.sin_addr.s_addr == send_sock->am.addr.sin.sin_addr.s_addr)
@@ -982,7 +981,7 @@ repeat_packet4(struct recv_sock *recv_sock) {
 
 	list_for_each_entry(send_sock, &send_socks4, list) {
 		// do not repeat packet back to the same network from which it originated
-		if ((recv_sock->from.sin.sin_addr.s_addr & send_sock->am.mask.in.s_addr) == send_sock->am.net.in.s_addr)
+		if (same_network(&recv_sock->from, &send_sock->am))
 			continue;
 
 		if (foreground)
