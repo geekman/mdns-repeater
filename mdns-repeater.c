@@ -124,6 +124,9 @@ void log_message(int loglevel, char *fmt_str, ...) {
 	va_list ap;
 	char buf[2048];
 
+	if (loglevel == LOG_DEBUG && !foreground)
+		return;
+
 	va_start(ap, fmt_str);
 	vsnprintf(buf, 2047, fmt_str, ap);
 	va_end(ap);
@@ -915,9 +918,9 @@ repeat_packet6(struct recv_sock *recv_sock, unsigned ifindex)
 	list_for_each_entry(send_sock, &send_socks6, list) {
 		list_for_each_entry(am, &send_sock->ams, list) {
 			if (same_address(&recv_sock->from, &am->addr)) {
-				if (foreground)
-					printf("skipping packet from=%s size=%zd (ourself)\n",
-					       recv_sock->from_str, recv_sock->pkt_size);
+				log_message(LOG_DEBUG,
+					    "skipping packet from=%s size=%zd (ourself)",
+					    recv_sock->from_str, recv_sock->pkt_size);
 				return;
 			}
 		}
@@ -925,29 +928,29 @@ repeat_packet6(struct recv_sock *recv_sock, unsigned ifindex)
 
 	if (!list_empty(&whitelisted_subnets) &&
 	    !subnet_match(&recv_sock->from, &whitelisted_subnets)) {
-		if (foreground)
-			printf("skipping packet from=%s size=%zd (not whitelisted)\n",
-			       recv_sock->from_str, recv_sock->pkt_size);
+		log_message(LOG_DEBUG,
+			    "skipping packet from=%s size=%zd (not whitelisted)",
+			    recv_sock->from_str, recv_sock->pkt_size);
 		return;
 	}
 
 	if (subnet_match(&recv_sock->from, &blacklisted_subnets)) {
-		if (foreground)
-			printf("skipping packet from=%s size=%zd (blacklisted)\n",
-			       recv_sock->from_str, recv_sock->pkt_size);
+		log_message(LOG_DEBUG,
+			    "skipping packet from=%s size=%zd (blacklisted)",
+			    recv_sock->from_str, recv_sock->pkt_size);
 		return;
 	}
 
-	if (foreground)
-		printf("got v6 packet from=%s size=%zd\n", recv_sock->from_str, recv_sock->pkt_size);
+	log_message(LOG_DEBUG,
+		    "got v6 packet from=%s size=%zd",
+		    recv_sock->from_str, recv_sock->pkt_size);
 
 	list_for_each_entry(send_sock, &send_socks6, list) {
 		// do not repeat packet back to the same interface from which it originated
 		if (send_sock->ifindex == ifindex)
 			continue;
 
-		if (foreground)
-			printf("repeating data to %s\n", send_sock->ifname);
+		log_message(LOG_DEBUG, "repeating data to %s", send_sock->ifname);
 
 		// repeat data
 		sentsize = send_packet6(send_sock->sockfd, recv_sock->pkt_data, recv_sock->pkt_size);
@@ -980,29 +983,29 @@ repeat_packet4(struct recv_sock *recv_sock) {
 
 	if (!list_empty(&whitelisted_subnets) &&
 	    !subnet_match(&recv_sock->from, &whitelisted_subnets)) {
-		if (foreground)
-			printf("skipping packet from=%s size=%zd (not whitelisted)\n",
-			       recv_sock->from_str, recv_sock->pkt_size);
+		log_message(LOG_DEBUG,
+			    "skipping packet from=%s size=%zd (not whitelisted)",
+			    recv_sock->from_str, recv_sock->pkt_size);
 		return;
 	}
 
 	if (subnet_match(&recv_sock->from, &blacklisted_subnets)) {
-		if (foreground)
-			printf("skipping packet from=%s size=%zd (blacklisted)\n",
-			       recv_sock->from_str, recv_sock->pkt_size);
+		log_message(LOG_DEBUG,
+			    "skipping packet from=%s size=%zd (blacklisted)",
+			    recv_sock->from_str, recv_sock->pkt_size);
 		return;
 	}
 
-	if (foreground)
-		printf("got v4 packet from=%s size=%zd\n", recv_sock->from_str, recv_sock->pkt_size);
+	log_message(LOG_DEBUG,
+		    "got v4 packet from=%s size=%zd",
+		    recv_sock->from_str, recv_sock->pkt_size);
 
 	list_for_each_entry(send_sock, &send_socks4, list) {
 		// do not repeat packet back to the same network from which it originated
 		if (same_network(&recv_sock->from, &send_sock->am))
 			continue;
 
-		if (foreground)
-			printf("repeating data to %s\n", send_sock->ifname);
+		log_message(LOG_DEBUG, "repeating data to %s", send_sock->ifname);
 
 		// repeat data
 		sentsize = send_packet4(send_sock->sockfd, recv_sock->pkt_data, recv_sock->pkt_size);
