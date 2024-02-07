@@ -43,6 +43,10 @@
 #define PACKAGE "mdns-repeater"
 #define MDNS_ADDR4 "224.0.0.251"
 #define MDNS_ADDR6 "FF02::FB"
+static const struct in6_addr mdns_addr6_in = { .s6_addr = {
+	0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfb,
+}};
 #define MDNS_PORT 5353
 
 #ifndef PIDFILE
@@ -78,6 +82,7 @@ LIST_HEAD(whitelisted_subnets);
 
 struct send_sock6 {
 	const char *ifname;			/* interface name	*/
+	unsigned ifindex;			/* interface index	*/
 	int sockfd;				/* socket fd		*/
 	struct list_head ams;			/* socket addr/mask/nets*/
 	struct list_head list;			/* socket list		*/
@@ -330,6 +335,7 @@ create_send_sock6(const char *ifname, struct list_head *recv_socks) {
 	memset(sock, 0, sizeof(*sock));
 	INIT_LIST_HEAD(&sock->ams);
 	sock->ifname = ifname;
+	sock->ifindex = ifindex;
 
 	if (getifaddrs(&ifap) < 0) {
 		log_message(LOG_ERR, "getifaddrs(): %s", strerror(errno));
@@ -765,7 +771,26 @@ out:
 }
 
 static bool
-subnet_match(struct sockaddr_in *fromaddr, struct list_head *subnets)
+subnet_match6(struct sockaddr_in6 *from, struct list_head *subnets)
+{
+	struct addr_mask *subnet;
+
+	list_for_each_entry(subnet, subnets, list) {
+		if (subnet->addr.ss.ss_family != AF_INET6)
+			continue;
+
+		for (int i = 0; i < sizeof(from->sin6_addr); i++)
+			if ((from->sin6_addr.s6_addr[i] & subnet->mask.in6.s6_addr[i]) != subnet->net.in6.s6_addr[i])
+				continue;
+
+		return true;
+	}
+
+	return false;
+}
+
+static bool
+subnet_match4(struct sockaddr_in *from, struct list_head *subnets)
 {
 	struct addr_mask *subnet;
 
@@ -773,7 +798,7 @@ subnet_match(struct sockaddr_in *fromaddr, struct list_head *subnets)
 		if (subnet->addr.ss.ss_family != AF_INET)
 			continue;
 
-		if ((fromaddr->sin_addr.s_addr & subnet->mask.in.s_addr) == subnet->net.in.s_addr)
+		if ((from->sin_addr.s_addr & subnet->mask.in.s_addr) == subnet->net.in.s_addr)
 			return true;
 	}
 
@@ -851,6 +876,64 @@ static int parse_opts(int argc, char *argv[]) {
 }
 
 static void
+repeat_packet6(struct recv_sock *recv_sock, unsigned ifindex)
+{
+	struct send_sock6 *send_sock;
+	struct addr_mask *am;
+	//bool our_net = false;
+	//ssize_t sentsize;
+
+	list_for_each_entry(send_sock, &send_socks6, list) {
+		list_for_each_entry(am, &send_sock->ams, list) {
+			if (IN6_ARE_ADDR_EQUAL(&recv_sock->from.sin6.sin6_addr,
+					       &am->addr.sin6.sin6_addr)) {
+				if (foreground)
+					printf("skipping packet from=%s size=%zd (ourself)\n",
+					       recv_sock->from_str, recv_sock->pkt_size);
+				return;
+			}
+		}
+	}
+
+	if (!list_empty(&whitelisted_subnets) &&
+	    !subnet_match6(&recv_sock->from.sin6, &whitelisted_subnets)) {
+		if (foreground)
+			printf("skipping packet from=%s size=%zd (not whitelisted)\n",
+			       recv_sock->from_str, recv_sock->pkt_size);
+		return;
+	}
+
+	if (subnet_match6(&recv_sock->from.sin6, &blacklisted_subnets)) {
+		if (foreground)
+			printf("skipping packet from=%s size=%zd (blacklisted)\n",
+			       recv_sock->from_str, recv_sock->pkt_size);
+		return;
+	}
+
+	if (foreground)
+		printf("got v6 packet from=%s size=%zd\n", recv_sock->from_str, recv_sock->pkt_size);
+
+	list_for_each_entry(send_sock, &send_socks6, list) {
+		// do not repeat packet back to the same interface from which it originated
+		if (send_sock->ifindex == ifindex)
+			continue;
+
+		if (foreground)
+			printf("repeating data to %s\n", send_sock->ifname);
+
+#if 0
+		// repeat data
+		sentsize = send_packet(send_sock->sockfd, recv_sock->pkt_data, recv_sock->pkt_size);
+		if (sentsize < 0)
+			log_message(LOG_ERR, "send(): %s", strerror(errno));
+		else if (sentsize != recv_sock->pkt_size)
+			log_message(LOG_ERR, "send_packet size differs: sent=%zd actual=%zd",
+				    recv_sock->pkt_size, sentsize);
+#endif
+	}
+}
+
+static void
 repeat_packet4(struct recv_sock *recv_sock) {
 	struct send_sock4 *send_sock;
 	bool our_net = false;
@@ -871,14 +954,14 @@ repeat_packet4(struct recv_sock *recv_sock) {
 		return;
 
 	if (!list_empty(&whitelisted_subnets) &&
-	    !subnet_match(&recv_sock->from.sin, &whitelisted_subnets)) {
+	    !subnet_match4(&recv_sock->from.sin, &whitelisted_subnets)) {
 		if (foreground)
 			printf("skipping packet from=%s size=%zd (not whitelisted)\n",
 			       recv_sock->from_str, recv_sock->pkt_size);
 		return;
 	}
 
-	if (subnet_match(&recv_sock->from.sin, &blacklisted_subnets)) {
+	if (subnet_match4(&recv_sock->from.sin, &blacklisted_subnets)) {
 		if (foreground)
 			printf("skipping packet from=%s size=%zd (blacklisted)\n",
 			       recv_sock->from_str, recv_sock->pkt_size);
@@ -904,14 +987,6 @@ repeat_packet4(struct recv_sock *recv_sock) {
 			log_message(LOG_ERR, "send_packet size differs: sent=%zd actual=%zd",
 				    recv_sock->pkt_size, sentsize);
 	}
-}
-
-static void
-repeat_packet6(struct recv_sock *recv_sock, unsigned ifindex)
-{
-	// Not implemented yet
-	printf("skipping v6 packet from=%s ifindex=%u size=%zd\n",
-	       recv_sock->from_str, ifindex, recv_sock->pkt_size);
 }
 
 static void
@@ -945,9 +1020,6 @@ recv_packet6(struct recv_sock *recv_sock)
 		return;
 
 	for (chdr = CMSG_FIRSTHDR(&msg); chdr; chdr = CMSG_NXTHDR(&msg, chdr)) {
-		printf("Got a hdr: lvl %i and type %i\n",
-		       chdr->cmsg_level, chdr->cmsg_type);
-
 		if (chdr->cmsg_level != IPPROTO_IPV6)
 			continue;
 
@@ -955,6 +1027,9 @@ recv_packet6(struct recv_sock *recv_sock)
 			continue;
 
 		pktinfo = (struct _in6_pktinfo *)CMSG_DATA(chdr);
+		if (!IN6_ARE_ADDR_EQUAL(&pktinfo->ipi6_addr, &mdns_addr6_in))
+			pktinfo = NULL;
+
 		break;
         }
 
