@@ -43,7 +43,7 @@
 #define PACKAGE "mdns-repeater"
 #define MDNS_ADDR4 "224.0.0.251"
 #define MDNS_ADDR6 "FF02::FB"
-static const struct in6_addr mdns_addr6_in = { .s6_addr = {
+static const struct in6_addr mdns_addr_in6 = { .s6_addr = {
 	0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfb,
 }};
@@ -558,16 +558,28 @@ out:
 	return NULL;
 }
 
-static ssize_t send_packet(int fd, const void *data, size_t len) {
-	static struct sockaddr_in toaddr;
-	if (toaddr.sin_family != AF_INET) {
-		memset(&toaddr, 0, sizeof(struct sockaddr_in));
-		toaddr.sin_family = AF_INET;
-		toaddr.sin_port = htons(MDNS_PORT);
-		toaddr.sin_addr.s_addr = inet_addr(MDNS_ADDR4);
-	}
+static ssize_t
+send_packet6(int fd, const char *data, size_t len) {
+	static struct sockaddr_in6 toaddr6;
 
-	return sendto(fd, data, len, 0, (struct sockaddr *) &toaddr, sizeof(struct sockaddr_in));
+	if (toaddr6.sin6_family != AF_INET6) {
+		toaddr6.sin6_family = AF_INET6;
+		toaddr6.sin6_port = htons(MDNS_PORT);
+		toaddr6.sin6_addr = mdns_addr_in6;
+	}
+	return sendto(fd, data, len, 0, (struct sockaddr *)&toaddr6, sizeof(toaddr6));
+}
+
+static ssize_t
+send_packet4(int fd, const char *data, size_t len) {
+	static struct sockaddr_in toaddr4;
+
+	if (toaddr4.sin_family != AF_INET) {
+		toaddr4.sin_family = AF_INET;
+		toaddr4.sin_port = htons(MDNS_PORT);
+		toaddr4.sin_addr.s_addr = inet_addr(MDNS_ADDR4);
+	}
+	return sendto(fd, data, len, 0, (struct sockaddr *)&toaddr4, sizeof(toaddr4));
 }
 
 static void
@@ -880,8 +892,7 @@ repeat_packet6(struct recv_sock *recv_sock, unsigned ifindex)
 {
 	struct send_sock6 *send_sock;
 	struct addr_mask *am;
-	//bool our_net = false;
-	//ssize_t sentsize;
+	ssize_t sentsize;
 
 	list_for_each_entry(send_sock, &send_socks6, list) {
 		list_for_each_entry(am, &send_sock->ams, list) {
@@ -921,15 +932,13 @@ repeat_packet6(struct recv_sock *recv_sock, unsigned ifindex)
 		if (foreground)
 			printf("repeating data to %s\n", send_sock->ifname);
 
-#if 0
 		// repeat data
-		sentsize = send_packet(send_sock->sockfd, recv_sock->pkt_data, recv_sock->pkt_size);
+		sentsize = send_packet6(send_sock->sockfd, recv_sock->pkt_data, recv_sock->pkt_size);
 		if (sentsize < 0)
-			log_message(LOG_ERR, "send(): %s", strerror(errno));
+			log_message(LOG_ERR, "send6(): %s", strerror(errno));
 		else if (sentsize != recv_sock->pkt_size)
-			log_message(LOG_ERR, "send_packet size differs: sent=%zd actual=%zd",
+			log_message(LOG_ERR, "send_packet6 size differs: sent=%zd actual=%zd",
 				    recv_sock->pkt_size, sentsize);
-#endif
 	}
 }
 
@@ -980,11 +989,11 @@ repeat_packet4(struct recv_sock *recv_sock) {
 			printf("repeating data to %s\n", send_sock->ifname);
 
 		// repeat data
-		sentsize = send_packet(send_sock->sockfd, recv_sock->pkt_data, recv_sock->pkt_size);
+		sentsize = send_packet4(send_sock->sockfd, recv_sock->pkt_data, recv_sock->pkt_size);
 		if (sentsize < 0)
-			log_message(LOG_ERR, "send(): %s", strerror(errno));
+			log_message(LOG_ERR, "send4(): %s", strerror(errno));
 		else if (sentsize != recv_sock->pkt_size)
-			log_message(LOG_ERR, "send_packet size differs: sent=%zd actual=%zd",
+			log_message(LOG_ERR, "send_packet4 size differs: sent=%zd actual=%zd",
 				    recv_sock->pkt_size, sentsize);
 	}
 }
@@ -1027,7 +1036,7 @@ recv_packet6(struct recv_sock *recv_sock)
 			continue;
 
 		pktinfo = (struct _in6_pktinfo *)CMSG_DATA(chdr);
-		if (!IN6_ARE_ADDR_EQUAL(&pktinfo->ipi6_addr, &mdns_addr6_in))
+		if (!IN6_ARE_ADDR_EQUAL(&pktinfo->ipi6_addr, &mdns_addr_in6))
 			pktinfo = NULL;
 
 		break;
