@@ -1,6 +1,7 @@
 /*
  * mdns-repeater.c - mDNS repeater daemon
  * Copyright (C) 2011 Darell Tan
+ * Copyright (C) 2024 David Härdeman <david@hardeman.nu>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -33,49 +34,90 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <net/if.h>
+#include <ifaddrs.h>
 #include <errno.h>
+#include <stdbool.h>
+#include <poll.h>
+
+#include "list.h"
 
 #define PACKAGE "mdns-repeater"
-#define MDNS_ADDR "224.0.0.251"
+#define MDNS_ADDR4 "224.0.0.251"
+#define MDNS_ADDR6 "FF02::FB"
+static const struct in6_addr mdns_addr_in6 = { .s6_addr = {
+	0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfb,
+}};
 #define MDNS_PORT 5353
 
 #ifndef PIDFILE
 #define PIDFILE "/var/run/" PACKAGE ".pid"
 #endif
 
-#define MAX_SOCKS 16
-#define MAX_SUBNETS 16
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 
-struct if_sock {
-	const char *ifname;	/* interface name  */
-	int sockfd;		/* socket filedesc */
-	struct in_addr addr;	/* interface addr  */
-	struct in_addr mask;	/* interface mask  */
-	struct in_addr net;	/* interface network (computed) */
+struct _in6_pktinfo {
+	struct in6_addr ipi6_addr;		/* src/dst IPv6 address	*/
+	unsigned int    ipi6_ifindex;		/* send/recv interface	*/
 };
 
-struct subnet {
-	struct in_addr addr;    /* subnet addr */
-	struct in_addr mask;    /* subnet mask */
-	struct in_addr net;     /* subnet net (computed) */
+union sockaddr_u {
+	struct sockaddr_storage ss;		/* socket addr		*/
+	struct sockaddr_in6 sin6;		/* socket addr (IPv6)	*/
+	struct sockaddr_in sin;			/* socket addr (IPv4)	*/
 };
 
-int server_sockfd = -1;
+union in_addr_u {
+	struct in6_addr in6;			/* address (IPv6)	*/
+	struct in_addr in;			/* address (IPv4)	*/
+};
 
-int num_socks = 0;
-struct if_sock socks[MAX_SOCKS];
+struct addr_mask {
+	union sockaddr_u addr;			/* socket addr		*/
+	union in_addr_u mask;			/* socket mask		*/
+	union in_addr_u net;			/* socket net		*/
+	struct list_head list;			/* addr_mask list	*/
+};
+LIST_HEAD(blacklisted_subnets);
+LIST_HEAD(whitelisted_subnets);
 
-int num_blacklisted_subnets = 0;
-struct subnet blacklisted_subnets[MAX_SUBNETS];
+struct send_sock6 {
+	const char *ifname;			/* interface name	*/
+	unsigned ifindex;			/* interface index	*/
+	int sockfd;				/* socket fd		*/
+	struct list_head ams;			/* addr/mask/net list	*/
+	struct list_head list;			/* socket list		*/
+};
+LIST_HEAD(send_socks6);
 
-int num_whitelisted_subnets = 0;
-struct subnet whitelisted_subnets[MAX_SUBNETS];
+struct send_sock4 {
+	const char *ifname;			/* interface name	*/
+	int sockfd;				/* socket fd		*/
+	struct addr_mask am;			/* socket addr/mask/net	*/
+	struct list_head list;			/* socket list		*/
+};
+LIST_HEAD(send_socks4);
 
 #define PACKET_SIZE 65536
-void *pkt_data = NULL;
+struct recv_sock {
+	const char *name;			/* name of this socket  */
+	int sockfd;				/* socket fd            */
+	char pkt_data[PACKET_SIZE];		/* incoming packet data */
+	ssize_t pkt_size;			/* incoming packet len	*/
+	union sockaddr_u addr;			/* socket addr		*/
+	union sockaddr_u from;			/* sender addr		*/
+	char from_str[INET6_ADDRSTRLEN];	/* sender addr (str)	*/
+	struct list_head list;			/* socket list          */
+};
+LIST_HEAD(recv_socks);
 
-int foreground = 0;
-int shutdown_flag = 0;
+bool foreground = false;
+bool ipv4_only = false;
+bool ipv6_only = false;
+
+int signal_pipe_fds[2];
+#define PIPE_RD 0
+#define PIPE_WR 1
 
 char *pid_file = PIDFILE;
 
@@ -84,6 +126,9 @@ const struct passwd* user = NULL;
 void log_message(int loglevel, char *fmt_str, ...) {
 	va_list ap;
 	char buf[2048];
+
+	if (loglevel == LOG_DEBUG && !foreground)
+		return;
 
 	va_start(ap, fmt_str);
 	vsnprintf(buf, 2047, fmt_str, ap);
@@ -97,154 +142,453 @@ void log_message(int loglevel, char *fmt_str, ...) {
 	}
 }
 
-static int create_recv_sock() {
-	int sd = socket(AF_INET, SOCK_DGRAM, 0);
-	if (sd < 0) {
-		log_message(LOG_ERR, "recv socket(): %s", strerror(errno));
-		return sd;
+static void *
+xmalloc(size_t size)
+{
+	void *tmp;
+
+	tmp = calloc(1, size);
+	if (!tmp)
+		log_message(LOG_ERR, "malloc(): %s", strerror(errno));
+	return tmp;
+}
+
+static char *
+addr6_mask_to_string(struct sockaddr_in6 *addr,
+		     struct in6_addr *mask,
+		     struct in6_addr *net) {
+	const char *fmt = "addr %s mask %s net %s";
+	/* sizeof(fmt) = some extra bytes, and it's compile-time constant */
+	static char msg[sizeof(fmt) + 3 * INET6_ADDRSTRLEN];
+	char addrbuf[INET6_ADDRSTRLEN];
+	char maskbuf[INET6_ADDRSTRLEN];
+	char netbuf[INET6_ADDRSTRLEN];
+
+	snprintf(msg, sizeof(msg), fmt,
+		 inet_ntop(AF_INET6, &addr->sin6_addr,
+			   addrbuf, sizeof(addrbuf)),
+		 inet_ntop(AF_INET6, mask, maskbuf, sizeof(maskbuf)),
+		 inet_ntop(AF_INET6, net, netbuf, sizeof(netbuf)));
+
+	return msg;
+}
+
+static char *
+addr4_mask_to_string(struct sockaddr_in *addr,
+		     struct in_addr *mask,
+		     struct in_addr *net) {
+	const char *fmt = "addr %s mask %s net %s";
+	/* sizeof(fmt) = some extra bytes, and it's compile-time constant */
+	static char msg[sizeof(fmt) + 3 * INET_ADDRSTRLEN];
+	char addrbuf[INET_ADDRSTRLEN];
+	char maskbuf[INET_ADDRSTRLEN];
+	char netbuf[INET_ADDRSTRLEN];
+
+	snprintf(msg, sizeof(msg), fmt,
+		 inet_ntop(AF_INET, &addr->sin_addr,
+			   addrbuf, sizeof(addrbuf)),
+		 inet_ntop(AF_INET, mask, maskbuf, sizeof(maskbuf)),
+		 inet_ntop(AF_INET, net, netbuf, sizeof(netbuf)));
+
+	return msg;
+}
+
+static char *
+addr_mask_to_string(struct addr_mask *nm)
+{
+	switch (nm->addr.ss.ss_family) {
+	case AF_INET6:
+		return addr6_mask_to_string(&nm->addr.sin6,
+					    &nm->mask.in6,
+					    &nm->net.in6);
+	case AF_INET:
+		return addr4_mask_to_string(&nm->addr.sin,
+					    &nm->mask.in,
+					    &nm->net.in);
+	default:
+		return "ERROR";
 	}
+}
 
-	int r = -1;
-
+static struct recv_sock *
+create_recv_sock6() {
+	struct recv_sock *sock;
+	int sd;
 	int on = 1;
-	if ((r = setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) < 0) {
-		log_message(LOG_ERR, "recv setsockopt(SO_REUSEADDR): %s", strerror(errno));
-		return r;
+
+	sock = xmalloc(sizeof(*sock));
+	if (!sock)
+		goto out;
+
+	sd = socket(AF_INET6, SOCK_DGRAM, 0);
+	if (sd < 0) {
+		log_message(LOG_ERR, "recv socket6(): %s", strerror(errno));
+		goto out;
+	}
+	sock->sockfd = sd;
+
+	// make sure that the socket uses only IPv6
+	if (setsockopt(sd, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on)) < 0) {
+		log_message(LOG_ERR, "send setsockopt(IPV6_V6ONLY): %s", strerror(errno));
+		goto out;
 	}
 
-	/* bind to an address */
-	struct sockaddr_in serveraddr;
-	memset(&serveraddr, 0, sizeof(serveraddr));
-	serveraddr.sin_family = AF_INET;
-	serveraddr.sin_port = htons(MDNS_PORT);
-	serveraddr.sin_addr.s_addr = htonl(INADDR_ANY);	/* receive multicast */
-	if ((r = bind(sd, (struct sockaddr *)&serveraddr, sizeof(serveraddr))) < 0) {
-		log_message(LOG_ERR, "recv bind(): %s", strerror(errno));
+	// make sure that the address can be used by other applications
+	if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
+		log_message(LOG_ERR, "recv setsockopt6(SO_REUSEADDR): %s", strerror(errno));
+		goto out;
 	}
 
 	// enable loopback in case someone else needs the data
-	if ((r = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_LOOP, &on, sizeof(on))) < 0) {
-		log_message(LOG_ERR, "recv setsockopt(IP_MULTICAST_LOOP): %s", strerror(errno));
-		return r;
+	if (setsockopt(sd, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, &on, sizeof(on)) < 0) {
+		log_message(LOG_ERR, "recv setsockopt(IPV6_MULTICAST_LOOP): %s", strerror(errno));
+		goto out;
 	}
 
-#ifdef IP_PKTINFO
-	if ((r = setsockopt(sd, SOL_IP, IP_PKTINFO, &on, sizeof(on))) < 0) {
-		log_message(LOG_ERR, "recv setsockopt(IP_PKTINFO): %s", strerror(errno));
-		return r;
-	}
-#endif
-
-	return sd;
-}
-
-static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock *sockdata) {
-	int sd = socket(AF_INET, SOCK_DGRAM, 0);
-	if (sd < 0) {
-		log_message(LOG_ERR, "send socket(): %s", strerror(errno));
-		return sd;
-	}
-
-	sockdata->ifname = ifname;
-	sockdata->sockfd = sd;
-
-	int r = -1;
-
-	struct ifreq ifr;
-	memset(&ifr, 0, sizeof(ifr));
-	strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
-	struct in_addr *if_addr = &((struct sockaddr_in *) &ifr.ifr_addr)->sin_addr;
-
-#ifdef SO_BINDTODEVICE
-	if ((r = setsockopt(sd, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(struct ifreq))) < 0) {
-		log_message(LOG_ERR, "send setsockopt(SO_BINDTODEVICE): %s", strerror(errno));
-		return r;
-	}
-#endif
-
-	// get netmask
-	if (ioctl(sd, SIOCGIFNETMASK, &ifr) == 0) {
-		memcpy(&sockdata->mask, if_addr, sizeof(struct in_addr));
-	}
-
-	// .. and interface address
-	if (ioctl(sd, SIOCGIFADDR, &ifr) == 0) {
-		memcpy(&sockdata->addr, if_addr, sizeof(struct in_addr));
-	}
-
-	// compute network (address & mask)
-	sockdata->net.s_addr = sockdata->addr.s_addr & sockdata->mask.s_addr;
-
-	int on = 1;
-	if ((r = setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) < 0) {
-		log_message(LOG_ERR, "send setsockopt(SO_REUSEADDR): %s", strerror(errno));
-		return r;
+	// provides info on which interface a packet arrived via
+	if (setsockopt(sd, IPPROTO_IPV6, IPV6_RECVPKTINFO,  &on, sizeof(on)) < 0) {
+		log_message(LOG_ERR, "recv setsockopt(IPV6_RECVPKTINFO): %s", strerror(errno));
+		goto out;
 	}
 
 	// bind to an address
-	struct sockaddr_in serveraddr;
-	memset(&serveraddr, 0, sizeof(serveraddr));
-	serveraddr.sin_family = AF_INET;
-	serveraddr.sin_port = htons(MDNS_PORT);
-	serveraddr.sin_addr.s_addr = if_addr->s_addr;
-	if ((r = bind(sd, (struct sockaddr *)&serveraddr, sizeof(serveraddr))) < 0) {
-		log_message(LOG_ERR, "send bind(): %s", strerror(errno));
+	sock->addr.sin6.sin6_family = AF_INET6;
+	sock->addr.sin6.sin6_port = htons(MDNS_PORT);
+	sock->addr.sin6.sin6_addr = in6addr_any;
+	if (bind(sd, (struct sockaddr *)&sock->addr.sin6, sizeof(sock->addr.sin6)) < 0) {
+		log_message(LOG_ERR, "recv bind6(): %s", strerror(errno));
+		goto out;
 	}
 
-#if __FreeBSD__
-	if((r = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_IF, &serveraddr.sin_addr, sizeof(serveraddr.sin_addr))) < 0) {
-		log_message(LOG_ERR, "send ip_multicast_if(): errno %d: %s", errno, strerror(errno));
-	}
-#endif
+	return sock;
 
-	// add membership to receiving socket
-	struct ip_mreq mreq;
-	memset(&mreq, 0, sizeof(struct ip_mreq));
-	mreq.imr_interface.s_addr = if_addr->s_addr;
-	mreq.imr_multiaddr.s_addr = inet_addr(MDNS_ADDR);
-	if ((r = setsockopt(recv_sockfd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq))) < 0) {
-		log_message(LOG_ERR, "recv setsockopt(IP_ADD_MEMBERSHIP): %s", strerror(errno));
-		return r;
+out:
+	free(sock);
+	return NULL;
+}
+
+static struct recv_sock *
+create_recv_sock4() {
+	struct recv_sock *sock;
+	int sd;
+	int on = 1;
+
+	sock = xmalloc(sizeof(*sock));
+	if (!sock)
+		log_message(LOG_ERR, "malloc(): %s", strerror(errno));
+
+	sd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sd < 0) {
+		log_message(LOG_ERR, "recv socket(): %s", strerror(errno));
+		goto out;
+	}
+	sock->sockfd = sd;
+
+	// make sure that the address can be used by other applications
+	if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
+		log_message(LOG_ERR, "recv setsockopt(SO_REUSEADDR): %s", strerror(errno));
+		goto out;
+	}
+
+	// bind to an address
+	sock->addr.sin.sin_family = AF_INET;
+	sock->addr.sin.sin_port = htons(MDNS_PORT);
+	sock->addr.sin.sin_addr.s_addr = htonl(INADDR_ANY);
+	if (bind(sd, (struct sockaddr *)&sock->addr.sin, sizeof(sock->addr.sin)) < 0) {
+		log_message(LOG_ERR, "recv bind(): %s", strerror(errno));
+		goto out;
 	}
 
 	// enable loopback in case someone else needs the data
-	if ((r = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_LOOP, &on, sizeof(on))) < 0) {
+	if (setsockopt(sd, IPPROTO_IP, IP_MULTICAST_LOOP, &on, sizeof(on)) < 0) {
+		log_message(LOG_ERR, "recv setsockopt(IP_MULTICAST_LOOP): %s", strerror(errno));
+		goto out;
+	}
+
+#ifdef IP_PKTINFO
+	if (setsockopt(sd, SOL_IP, IP_PKTINFO, &on, sizeof(on)) < 0) {
+		log_message(LOG_ERR, "recv setsockopt(IP_PKTINFO): %s", strerror(errno));
+		goto out;
+	}
+#endif
+
+	return sock;
+
+out:
+	free(sock);
+	return NULL;
+}
+
+static struct send_sock6 *
+create_send_sock6(const char *ifname, struct list_head *recv_socks) {
+	struct send_sock6 *sock = NULL;
+	struct addr_mask *am, *tmp_am;
+	int sd = -1;
+	int ifindex;
+	int on = 1;
+	int ttl = 255; // https://datatracker.ietf.org/doc/html/rfc6762#section-11
+	struct ipv6_mreq mreq6;
+	struct recv_sock *recv_sock;
+	struct ifaddrs *ifa, *ifap = NULL;
+	struct sockaddr_in6 *bindaddr = NULL;
+
+	ifindex = if_nametoindex (ifname);
+	if (ifindex < 1) {
+		log_message(LOG_ERR, "if_nametoindex(%s): %s", ifname, strerror(errno));
+		goto out;
+	}
+
+	sock = xmalloc(sizeof(*sock));
+	if (!sock)
+		goto out;
+
+	INIT_LIST_HEAD(&sock->ams);
+	sock->ifname = ifname;
+	sock->ifindex = ifindex;
+
+	if (getifaddrs(&ifap) < 0) {
+		log_message(LOG_ERR, "getifaddrs(): %s", strerror(errno));
+		goto out;
+	}
+
+	for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
+		if (!ifa->ifa_addr)
+			continue;
+		else if (ifa->ifa_addr->sa_family != AF_INET6)
+			continue;
+		else if (!ifa->ifa_netmask)
+			continue;
+		else if (strcmp(ifa->ifa_name, ifname))
+			continue;
+
+		am = xmalloc(sizeof(*am));
+		if (!am)
+			goto out;
+
+		am->addr.ss.ss_family = AF_INET6;
+		am->addr.sin6.sin6_port = htons(MDNS_PORT);
+		am->addr.sin6.sin6_addr = ((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr;
+		am->addr.sin6.sin6_scope_id = ifindex;
+		am->mask.in6 = ((struct sockaddr_in6 *)ifa->ifa_netmask)->sin6_addr;
+		for (int i = 0; i < sizeof(am->net.in6.s6_addr); i++)
+		     am->net.in6.s6_addr[i] = am->addr.sin6.sin6_addr.s6_addr[i] &
+					      am->mask.in6.s6_addr[i];
+		list_add(&am->list, &sock->ams);
+
+		if (IN6_IS_ADDR_LINKLOCAL(&am->addr.sin6.sin6_addr))
+			bindaddr = &am->addr.sin6;
+	}
+
+	if (!bindaddr) {
+		log_message(LOG_ERR, "no IPv6 link-local address for dev %s", ifname);
+		goto out;
+	}
+
+	sd = socket(AF_INET6, SOCK_DGRAM, 0);
+	if (sd < 0) {
+		log_message(LOG_ERR, "send socket6(): %s", strerror(errno));
+		goto out;
+	}
+	sock->sockfd = sd;
+
+	// make sure that the socket uses only IPv6
+	if (setsockopt(sd, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on)) < 0) {
+		log_message(LOG_ERR, "send setsockopt(IPV6_V6ONLY): %s", strerror(errno));
+		goto out;
+	}
+
+	// make sure that the address can be used by other applications
+	if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
+		log_message(LOG_ERR, "send setsockopt6(SO_REUSEADDR): %s", strerror(errno));
+		goto out;
+	}
+
+	// bind to the address
+	if (bind(sd, (struct sockaddr *)bindaddr, sizeof(*bindaddr)) < 0) {
+		log_message(LOG_ERR, "send bind6(): %s %i %i", strerror(errno), errno, EINVAL);
+		goto out;
+	}
+
+	// bind to the device
+	if (setsockopt(sd, IPPROTO_IPV6, IPV6_MULTICAST_IF, &ifindex, sizeof(ifindex)) < 0) {
+		log_message(LOG_ERR, "send setsockopt(IPV6_MULTICAST_IF): %s", strerror(errno));
+		goto out;
+	}
+
+	// enable loopback in case someone else needs the data
+	if (setsockopt(sd, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, &on, sizeof(on)) < 0) {
+		log_message(LOG_ERR, "send setsockopt(IPV6_MULTICAST_LOOP): %s", strerror(errno));
+		goto out;
+	}
+
+	// set the TTL per RFC6762
+	if (setsockopt(sd, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &ttl, sizeof(ttl)) < 0) {
+		log_message(LOG_ERR, "send setsockopt(IPV6_MULTICAST_HOPS): %s", strerror(errno));
+		goto out;
+	}
+
+	// add membership to receiving sockets
+	memset(&mreq6, 0, sizeof(mreq6));
+	inet_pton(AF_INET6, MDNS_ADDR6, &mreq6.ipv6mr_multiaddr.s6_addr);
+	mreq6.ipv6mr_interface = ifindex;
+
+	list_for_each_entry(recv_sock, recv_socks, list) {
+		if (recv_sock->addr.ss.ss_family != AF_INET6)
+			continue;
+
+		if (setsockopt(recv_sock->sockfd, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP,
+			       &mreq6, sizeof(mreq6)) < 0) {
+			log_message(LOG_ERR, "recv setsockopt(IPV6_ADD_MEMBERSHIP): %s", strerror(errno));
+			goto out;
+		}
+	}
+
+	list_for_each_entry(am, &sock->ams, list)
+		log_message(LOG_INFO, "dev %s %s", sock->ifname, addr_mask_to_string(am));
+
+	freeifaddrs(ifap);
+	return sock;
+
+out:
+	if (sock) {
+		list_for_each_entry_safe(am, tmp_am, &sock->ams, list) {
+			list_del(&am->list);
+			free(am);
+		}
+		free(sock);
+	}
+	close(sd);
+	freeifaddrs(ifap);
+	return NULL;
+}
+
+static struct send_sock4 *
+create_send_sock4(const char *ifname, struct list_head *recv_socks) {
+	struct send_sock4 *sock;
+	int sd = -1;
+	struct ifreq ifr;
+	struct in_addr *if_addr = &((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr;
+	int on = 1;
+	int ttl = 255; // https://datatracker.ietf.org/doc/html/rfc6762#section-11
+	struct ip_mreq mreq;
+	struct recv_sock *recv_sock;
+
+	sock = xmalloc(sizeof(*sock));
+	if (!sock)
+		goto out;
+
+	sock->ifname = ifname;
+
+	sd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sd < 0) {
+		log_message(LOG_ERR, "send socket4(): %s", strerror(errno));
+		goto out;
+	}
+	sock->sockfd = sd;
+
+	// get netmask
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
+	if (ioctl(sd, SIOCGIFNETMASK, &ifr) < 0) {
+		log_message(LOG_ERR, "ioctl(SIOCGIFNETMASK): %s", strerror(errno));
+		goto out;
+	}
+	sock->am.mask.in = *if_addr;
+
+	// ...and interface address
+	if (ioctl(sd, SIOCGIFADDR, &ifr) < 0) {
+		log_message(LOG_ERR, "ioctl(SIOCGIFADDR): %s", strerror(errno));
+		goto out;
+	}
+	memcpy(&sock->am.addr.sin.sin_addr, if_addr, sizeof(*if_addr));
+	sock->am.addr.ss.ss_family = AF_INET;
+	sock->am.addr.sin.sin_port = htons(MDNS_PORT);
+
+	// ...then compute the network
+	sock->am.net.in.s_addr = sock->am.addr.sin.sin_addr.s_addr & sock->am.mask.in.s_addr;
+
+	// make sure that the address can be used by other applications
+	if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
+		log_message(LOG_ERR, "send setsockopt4(SO_REUSEADDR): %s", strerror(errno));
+		goto out;
+	}
+
+	// bind to the address
+	if (bind(sd, (struct sockaddr *)&sock->am.addr.sin, sizeof(sock->am.addr.sin)) < 0) {
+		log_message(LOG_ERR, "send bind4(): %s", strerror(errno));
+		goto out;
+	}
+
+	// bind to the device
+	if (setsockopt(sd, IPPROTO_IP, IP_MULTICAST_IF, &sock->am.addr.sin.sin_addr, sizeof(sock->am.addr.sin)) < 0) {
+		log_message(LOG_ERR, "send setsockopt(IP_MULTICAST_IF): %s", strerror(errno));
+		goto out;
+	}
+
+	// enable loopback in case someone else needs the data
+	if (setsockopt(sd, IPPROTO_IP, IP_MULTICAST_LOOP, &on, sizeof(on)) < 0) {
 		log_message(LOG_ERR, "send setsockopt(IP_MULTICAST_LOOP): %s", strerror(errno));
-		return r;
+		goto out;
 	}
 
-	int ttl = 255; // IP TTL should be 255: https://datatracker.ietf.org/doc/html/rfc6762#section-11
-	if ((r = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl))) < 0) {
+	// set the TTL per RFC6762
+	if (setsockopt(sd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl)) < 0) {
 		log_message(LOG_ERR, "send setsockopt(IP_MULTICAST_TTL): %s", strerror(errno));
-		return r;
+		goto out;
 	}
 
-	char *addr_str = strdup(inet_ntoa(sockdata->addr));
-	char *mask_str = strdup(inet_ntoa(sockdata->mask));
-	char *net_str  = strdup(inet_ntoa(sockdata->net));
-	log_message(LOG_INFO, "dev %s addr %s mask %s net %s", ifr.ifr_name, addr_str, mask_str, net_str);
-	free(addr_str);
-	free(mask_str);
-	free(net_str);
+	// add membership to receiving sockets
+	memset(&mreq, 0, sizeof(mreq));
+	mreq.imr_interface.s_addr = if_addr->s_addr;
+	mreq.imr_multiaddr.s_addr = inet_addr(MDNS_ADDR4);
 
-	return sd;
-}
+	list_for_each_entry(recv_sock, recv_socks, list) {
+		if (recv_sock->addr.ss.ss_family != AF_INET)
+			continue;
 
-static ssize_t send_packet(int fd, const void *data, size_t len) {
-	static struct sockaddr_in toaddr;
-	if (toaddr.sin_family != AF_INET) {
-		memset(&toaddr, 0, sizeof(struct sockaddr_in));
-		toaddr.sin_family = AF_INET;
-		toaddr.sin_port = htons(MDNS_PORT);
-		toaddr.sin_addr.s_addr = inet_addr(MDNS_ADDR);
+		if (setsockopt(recv_sock->sockfd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+			       &mreq, sizeof(mreq)) < 0) {
+			log_message(LOG_ERR, "recv setsockopt(IP_ADD_MEMBERSHIP): %s", strerror(errno));
+			goto out;
+		}
 	}
 
-	return sendto(fd, data, len, 0, (struct sockaddr *) &toaddr, sizeof(struct sockaddr_in));
+	log_message(LOG_INFO, "dev %s %s", sock->ifname, addr_mask_to_string(&sock->am));
+	return sock;
+
+out:
+	free(sock);
+	close(sd);
+	return NULL;
 }
 
-static void mdns_repeater_shutdown(int sig) {
-	(void)sig;
-	shutdown_flag = 1;
+static ssize_t
+send_packet6(int fd, const char *data, size_t len) {
+	static struct sockaddr_in6 toaddr6;
+
+	if (toaddr6.sin6_family != AF_INET6) {
+		toaddr6.sin6_family = AF_INET6;
+		toaddr6.sin6_port = htons(MDNS_PORT);
+		toaddr6.sin6_addr = mdns_addr_in6;
+	}
+	return sendto(fd, data, len, 0, (struct sockaddr *)&toaddr6, sizeof(toaddr6));
+}
+
+static ssize_t
+send_packet4(int fd, const char *data, size_t len) {
+	static struct sockaddr_in toaddr4;
+
+	if (toaddr4.sin_family != AF_INET) {
+		toaddr4.sin_family = AF_INET;
+		toaddr4.sin_port = htons(MDNS_PORT);
+		toaddr4.sin_addr.s_addr = inet_addr(MDNS_ADDR4);
+	}
+	return sendto(fd, data, len, 0, (struct sockaddr *)&toaddr4, sizeof(toaddr4));
+}
+
+static void
+signal_shutdown(int sig) {
+	write(signal_pipe_fds[PIPE_WR], &sig, 1);
 }
 
 static pid_t already_running() {
@@ -294,7 +638,7 @@ static void daemonize() {
 	// signals
 	signal(SIGCHLD, SIG_IGN);
 	signal(SIGHUP, SIG_IGN);
-	signal(SIGTERM, mdns_repeater_shutdown);
+	signal(SIGTERM, signal_shutdown);
 
 	setsid();
 	umask(0027);
@@ -335,86 +679,191 @@ static void switch_user() {
 	}
 }
 
-static void show_help(const char *progname) {
+static void
+show_help(const char *progname)
+{
 	fprintf(stderr, "mDNS repeater (version " HGVERSION ")\n");
-	fprintf(stderr, "Copyright (C) 2011 Darell Tan\n\n");
+	fprintf(stderr, "Copyright (C) 2011-2024 Darell Tan\n\n");
 
-	fprintf(stderr, "usage: %s [ -f ] <ifdev> ...\n", progname);
+	fprintf(stderr, "Usage: %s [options] <ifdev> ...\n", progname);
 	fprintf(stderr, "\n"
-					"<ifdev> specifies an interface like \"eth0\"\n"
-					"packets received on an interface is repeated across all other specified interfaces\n"
-					"maximum number of interfaces is 5\n"
-					"\n"
-					" flags:\n"
-					"	-f	runs in foreground for debugging\n"
-					"	-b	blacklist subnet (eg. 192.168.1.1/24)\n"
-					"	-w	whitelist subnet (eg. 192.168.1.1/24)\n"
-					"	-p	specifies the pid file path (default: " PIDFILE ")\n"
-					"	-u	run as this user (by name)\n"
-					"	-h	shows this help\n"
-					"\n"
-		);
+			"<ifdev> specifies an interface like \"eth0\"\n"
+			"Packets received on an interface is repeated across all other specified interfaces\n"
+			"\n"
+			"Options:\n"
+			"	-f	runs in foreground for debugging\n"
+			"	-b	blacklist subnet (eg. 192.168.1.1/24 or fc00::/7)\n"
+			"	-w	whitelist subnet (eg. 192.168.1.1/24 or fc00::/7)\n"
+			"	-p	specifies the pid file path (default: " PIDFILE ")\n"
+			"	-u	run as this user (by name)\n"
+			"	-4	use IPv4 only\n"
+			"	-6	use IPv6 only\n"
+			"	-h	shows this help\n"
+			"\n"
+	);
 }
 
-int parse(char *input, struct subnet *s) {
-	int delim = 0;
-	int end = 0;
-	while (input[end] != 0) {
-		if (input[end] == '/') {
-			delim = end;
+/*
+ * Expected input, strings of the form:
+ *   192.168.0.12/24
+ *   2001:db8::/32
+ */
+static struct addr_mask *
+parse_subnet(const char *input) {
+	struct addr_mask *subnet;
+	char *addr_str = NULL;
+	char *delim;
+	struct in6_addr *addr_in6;
+	struct in_addr *addr_in;
+	int prefix_len;
+
+	subnet = xmalloc(sizeof(*subnet));
+	if (!subnet)
+		goto out;
+
+	addr_str = strdup(input);
+	if (!addr_str) {
+		log_message(LOG_ERR, "strdup(): %s", strerror(errno));
+		goto out;
+	}
+
+	delim = strchr(addr_str, '/');
+	if (!delim) {
+		log_message(LOG_ERR, "invalid blacklist/whitelist argument: %s", input);
+		goto out;
+	}
+
+	*delim = '\0';
+	delim++;
+	prefix_len = atoi(delim);
+	if (prefix_len < 0) {
+		log_message(LOG_ERR, "invalid blacklist/whitelist prefix length: %s", input);
+		goto out;
+	}
+
+	addr_in6 = &subnet->addr.sin6.sin6_addr;
+	addr_in = &subnet->addr.sin.sin_addr;
+
+	// First, try parsing an IPv6 address
+	if (inet_pton(AF_INET6, addr_str, addr_in6) == 1) {
+		if (prefix_len > 128) {
+			log_message(LOG_ERR, "blacklist/whitelist prefix length > 128: %s", input);
+			goto out;
 		}
-		end++;
+
+		for (int i = 0; i < sizeof(addr_in6->s6_addr); i++) {
+			uint8_t mask = 0xff << (8 - MIN(prefix_len, 8));
+			prefix_len -= MIN(prefix_len, 8);
+			subnet->mask.in6.s6_addr[i] = mask;
+			subnet->net.in6.s6_addr[i] = addr_in6->s6_addr[i] & mask;
+		}
+
+		subnet->addr.ss.ss_family = AF_INET6;
+
+	// Second, try parsing an IPv4 address
+	} else if (inet_pton(AF_INET, addr_str, addr_in) == 1) {
+		if (prefix_len > 32) {
+			log_message(LOG_ERR, "blacklist/whitelist prefix length > 32: %s", input);
+			goto out;
+		}
+
+		subnet->mask.in.s_addr = ntohl(0xFFFFFFFF << (32 - prefix_len));
+		subnet->net.in.s_addr = addr_in->s_addr & subnet->mask.in.s_addr;
+		subnet->addr.ss.ss_family = AF_INET;
+
+	// Give up
+	} else {
+		log_message(LOG_ERR, "could not parse blacklist/whitelist netmask: %s", input);
+		goto out;
 	}
 
-	if (end == 0 || delim == 0 || end == delim) {
-		return -1;
-	}
-
-	char *addr = (char*) malloc(end);
-
-	memset(addr, 0, end);
-	strncpy(addr, input, delim);
-	if (inet_pton(AF_INET, addr, &s->addr) != 1) {
-		free(addr);
-		return -2;
-	}
-
-	memset(addr, 0, end);
-	strncpy(addr, input+delim+1, end-delim-1);
-	int mask = atoi(addr);
-	free(addr);
-
-	if (mask < 0 || mask > 32) {
-		return -3;
-	}
-
-	s->mask.s_addr = ntohl((uint32_t)0xFFFFFFFF << (32 - mask));
-	s->net.s_addr = s->addr.s_addr & s->mask.s_addr;
-
-	return 0;
-}
-
-int tostring(struct subnet *s, char* buf, int len) {
-	char *addr_str = strdup(inet_ntoa(s->addr));
-	char *mask_str = strdup(inet_ntoa(s->mask));
-	char *net_str = strdup(inet_ntoa(s->net));
-	int l = snprintf(buf, len, "addr %s mask %s net %s", addr_str, mask_str, net_str);
 	free(addr_str);
-	free(mask_str);
-	free(net_str);
+	return subnet;
 
-	return l;
+out:
+	free(addr_str);
+	free(subnet);
+	return NULL;
 }
 
-static int parse_opts(int argc, char *argv[]) {
-	int c, res;
-	int help = 0;
-	struct subnet *ss;
-	char *msg;
-	while ((c = getopt(argc, argv, "hfp:b:w:u:")) != -1) {
+static bool
+same_address(union sockaddr_u *a, union sockaddr_u *b)
+{
+	if (a->ss.ss_family != b->ss.ss_family)
+		return false;
+
+	switch (a->ss.ss_family) {
+	case AF_INET6:
+		return IN6_ARE_ADDR_EQUAL(&a->sin6.sin6_addr,
+					  &b->sin6.sin6_addr);
+	case AF_INET:
+		return (a->sin.sin_addr.s_addr ==
+			b->sin.sin_addr.s_addr);
+	default:
+		return false;
+	}
+}
+
+static bool
+same_network(union sockaddr_u *addr, struct addr_mask *addr_mask)
+{
+	if (addr->ss.ss_family != addr_mask->addr.ss.ss_family)
+		return false;
+
+	switch (addr->ss.ss_family) {
+	case AF_INET6:
+		for (int i = 0; i < sizeof(addr->sin6.sin6_addr.s6_addr); i++)
+			if ((addr->sin6.sin6_addr.s6_addr[i] &
+			     addr_mask->mask.in6.s6_addr[i])
+			    != addr_mask->net.in6.s6_addr[i])
+				return false;
+		return true;
+	case AF_INET:
+		return ((addr->sin.sin_addr.s_addr &
+			 addr_mask->mask.in.s_addr)
+			== addr_mask->net.in.s_addr);
+	default:
+		return false;
+	}
+}
+
+static bool
+subnet_match(union sockaddr_u *from, struct list_head *subnets)
+{
+	struct addr_mask *subnet;
+
+	list_for_each_entry(subnet, subnets, list)
+		if (same_network(from, subnet))
+			return true;
+
+	return false;
+}
+
+static int
+parse_opts(int argc, char *argv[])
+{
+	int c;
+	bool help = false;
+	struct addr_mask *subnet;
+
+	while ((c = getopt(argc, argv, "hf46p:b:w:u:")) != -1) {
 		switch (c) {
-			case 'h': help = 1; break;
-			case 'f': foreground = 1; break;
+			case 'h':
+				help = true;
+				break;
+
+			case 'f':
+				foreground = true;
+				break;
+
+			case '4':
+				ipv4_only = true;
+				break;
+
+			case '6':
+				ipv6_only = true;
+				break;
+
 			case 'p':
 				if (optarg[0] != '/')
 					log_message(LOG_ERR, "pid file path must be absolute");
@@ -423,88 +872,47 @@ static int parse_opts(int argc, char *argv[]) {
 				break;
 
 			case 'b':
-				if (num_blacklisted_subnets >= MAX_SUBNETS) {
-					log_message(LOG_ERR, "too many blacklisted subnets (maximum is %d)", MAX_SUBNETS);
+				subnet = parse_subnet(optarg);
+				if (!subnet)
 					exit(2);
-				}
-
-				if (num_whitelisted_subnets != 0) {
-					log_message(LOG_ERR, "simultaneous whitelisting and blacklisting does not make sense");
-					exit(2);
-				}
-
-				ss = &blacklisted_subnets[num_blacklisted_subnets];
-				res = parse(optarg, ss);
-				switch (res) {
-					case -1:
-						log_message(LOG_ERR, "invalid blacklist argument");
-						exit(2);
-					case -2:
-						log_message(LOG_ERR, "could not parse netmask");
-						exit(2);
-					case -3:
-						log_message(LOG_ERR, "invalid netmask");
-						exit(2);
-				}
-
-				num_blacklisted_subnets++;
-
-				msg = malloc(128);
-				memset(msg, 0, 128);
-				tostring(ss, msg, 128);
-				log_message(LOG_INFO, "blacklist %s", msg);
-				free(msg);
+				list_add(&subnet->list, &blacklisted_subnets);
+				log_message(LOG_INFO, "blacklist %s", addr_mask_to_string(subnet));
 				break;
+
 			case 'w':
-				if (num_whitelisted_subnets >= MAX_SUBNETS) {
-					log_message(LOG_ERR, "too many whitelisted subnets (maximum is %d)", MAX_SUBNETS);
+				subnet = parse_subnet(optarg);
+				if (!subnet)
 					exit(2);
-				}
-
-				if (num_blacklisted_subnets != 0) {
-					log_message(LOG_ERR, "simultaneous whitelisting and blacklisting does not make sense");
-					exit(2);
-				}
-
-				ss = &whitelisted_subnets[num_whitelisted_subnets];
-				res = parse(optarg, ss);
-				switch (res) {
-					case -1:
-						log_message(LOG_ERR, "invalid whitelist argument");
-						exit(2);
-					case -2:
-						log_message(LOG_ERR, "could not parse netmask");
-						exit(2);
-					case -3:
-						log_message(LOG_ERR, "invalid netmask");
-						exit(2);
-				}
-
-				num_whitelisted_subnets++;
-
-				msg = malloc(128);
-				memset(msg, 0, 128);
-				tostring(ss, msg, 128);
-				log_message(LOG_INFO, "whitelist %s", msg);
-				free(msg);
+				list_add(&subnet->list, &whitelisted_subnets);
+				log_message(LOG_INFO, "whitelist %s", addr_mask_to_string(subnet));
 				break;
+
 			case '?':
 			case ':':
 				fputs("\n", stderr);
 				break;
 
-			case 'u': {
+			case 'u':
 				if ((user = getpwnam(optarg)) == NULL) {
 					log_message(LOG_ERR, "No such user '%s'", optarg);
 					exit(2);
 				}
 				break;
-			}
 
 			default:
 				log_message(LOG_ERR, "unknown option %c", optopt);
 				exit(2);
 		}
+	}
+
+	if (ipv4_only && ipv6_only) {
+		log_message(LOG_ERR, "simultaneous IPv4 and IPv6-only mode does not make sense");
+		exit(2);
+	}
+
+	if (!list_empty(&whitelisted_subnets) && !list_empty(&blacklisted_subnets)) {
+		log_message(LOG_ERR, "simultaneous whitelisting and blacklisting does not make sense");
+		exit(2);
 	}
 
 	if (help) {
@@ -515,10 +923,214 @@ static int parse_opts(int argc, char *argv[]) {
 	return optind;
 }
 
+static void
+repeat_packet6(struct recv_sock *recv_sock, unsigned ifindex)
+{
+	struct send_sock6 *send_sock;
+	struct addr_mask *am;
+	ssize_t sentsize;
+
+	list_for_each_entry(send_sock, &send_socks6, list) {
+		list_for_each_entry(am, &send_sock->ams, list) {
+			if (same_address(&recv_sock->from, &am->addr)) {
+				log_message(LOG_DEBUG,
+					    "skipping packet from=%s size=%zd (ourself)",
+					    recv_sock->from_str, recv_sock->pkt_size);
+				return;
+			}
+		}
+	}
+
+	if (!list_empty(&whitelisted_subnets) &&
+	    !subnet_match(&recv_sock->from, &whitelisted_subnets)) {
+		log_message(LOG_DEBUG,
+			    "skipping packet from=%s size=%zd (not whitelisted)",
+			    recv_sock->from_str, recv_sock->pkt_size);
+		return;
+	}
+
+	if (subnet_match(&recv_sock->from, &blacklisted_subnets)) {
+		log_message(LOG_DEBUG,
+			    "skipping packet from=%s size=%zd (blacklisted)",
+			    recv_sock->from_str, recv_sock->pkt_size);
+		return;
+	}
+
+	log_message(LOG_DEBUG,
+		    "got v6 packet from=%s size=%zd",
+		    recv_sock->from_str, recv_sock->pkt_size);
+
+	list_for_each_entry(send_sock, &send_socks6, list) {
+		// do not repeat packet back to the same interface from which it originated
+		if (send_sock->ifindex == ifindex)
+			continue;
+
+		log_message(LOG_DEBUG, "repeating data to %s", send_sock->ifname);
+
+		// repeat data
+		sentsize = send_packet6(send_sock->sockfd, recv_sock->pkt_data, recv_sock->pkt_size);
+		if (sentsize < 0)
+			log_message(LOG_ERR, "send6(): %s", strerror(errno));
+		else if (sentsize != recv_sock->pkt_size)
+			log_message(LOG_ERR, "send_packet6 size differs: sent=%zd actual=%zd",
+				    recv_sock->pkt_size, sentsize);
+	}
+}
+
+static void
+repeat_packet4(struct recv_sock *recv_sock) {
+	struct send_sock4 *send_sock;
+	bool our_net = false;
+	ssize_t sentsize;
+
+	list_for_each_entry(send_sock, &send_socks4, list) {
+		// make sure packet originated from specified networks
+		if (same_network(&recv_sock->from, &send_sock->am))
+			our_net = true;
+
+		// check for loopback
+		if (same_address(&recv_sock->from, &send_sock->am.addr))
+			return;
+	}
+
+	if (!our_net)
+		return;
+
+	if (!list_empty(&whitelisted_subnets) &&
+	    !subnet_match(&recv_sock->from, &whitelisted_subnets)) {
+		log_message(LOG_DEBUG,
+			    "skipping packet from=%s size=%zd (not whitelisted)",
+			    recv_sock->from_str, recv_sock->pkt_size);
+		return;
+	}
+
+	if (subnet_match(&recv_sock->from, &blacklisted_subnets)) {
+		log_message(LOG_DEBUG,
+			    "skipping packet from=%s size=%zd (blacklisted)",
+			    recv_sock->from_str, recv_sock->pkt_size);
+		return;
+	}
+
+	log_message(LOG_DEBUG,
+		    "got v4 packet from=%s size=%zd",
+		    recv_sock->from_str, recv_sock->pkt_size);
+
+	list_for_each_entry(send_sock, &send_socks4, list) {
+		// do not repeat packet back to the same network from which it originated
+		if (same_network(&recv_sock->from, &send_sock->am))
+			continue;
+
+		log_message(LOG_DEBUG, "repeating data to %s", send_sock->ifname);
+
+		// repeat data
+		sentsize = send_packet4(send_sock->sockfd, recv_sock->pkt_data, recv_sock->pkt_size);
+		if (sentsize < 0)
+			log_message(LOG_ERR, "send4(): %s", strerror(errno));
+		else if (sentsize != recv_sock->pkt_size)
+			log_message(LOG_ERR, "send_packet4 size differs: sent=%zd actual=%zd",
+				    recv_sock->pkt_size, sentsize);
+	}
+}
+
+static void
+recv_packet6(struct recv_sock *recv_sock)
+{
+	uint8_t cmsgbuf[1024];
+	struct iovec iov[] = {
+		{
+			.iov_base = &recv_sock->pkt_data,
+			.iov_len = sizeof(recv_sock->pkt_data),
+		}
+	};
+	struct msghdr msg = {
+		.msg_name = &recv_sock->from,
+		.msg_namelen = sizeof(recv_sock->from),
+		.msg_iov = iov,
+		.msg_iovlen = 1,
+		.msg_control = cmsgbuf,
+		.msg_controllen = sizeof(cmsgbuf),
+		.msg_flags = 0,
+	};
+	struct cmsghdr *chdr;
+	struct _in6_pktinfo *pktinfo = NULL;
+
+	recv_sock->pkt_size = recvmsg(recv_sock->sockfd, &msg, 0);
+	if (recv_sock->pkt_size < 0)
+		return;
+	else if (msg.msg_flags & MSG_TRUNC)
+		return;
+	else if (msg.msg_flags & MSG_CTRUNC)
+		return;
+
+	for (chdr = CMSG_FIRSTHDR(&msg); chdr; chdr = CMSG_NXTHDR(&msg, chdr)) {
+		if (chdr->cmsg_level != IPPROTO_IPV6)
+			continue;
+
+		if (chdr->cmsg_type != IPV6_PKTINFO)
+			continue;
+
+		pktinfo = (struct _in6_pktinfo *)CMSG_DATA(chdr);
+		if (!IN6_ARE_ADDR_EQUAL(&pktinfo->ipi6_addr, &mdns_addr_in6))
+			pktinfo = NULL;
+
+		break;
+        }
+
+	if (!pktinfo)
+		return;
+
+	if (!inet_ntop(AF_INET6,
+		       &recv_sock->from.sin6.sin6_addr,
+		       recv_sock->from_str,
+		       sizeof(recv_sock->from_str)))
+		recv_sock->from_str[0] = '\0';
+	repeat_packet6(recv_sock, pktinfo->ipi6_ifindex);
+}
+
+static void
+recv_packet4(struct recv_sock *recv_sock)
+{
+	socklen_t sockaddr_size = sizeof(recv_sock->from);
+
+	recv_sock->pkt_size = recvfrom(recv_sock->sockfd,
+				       recv_sock->pkt_data,
+				       sizeof(recv_sock->pkt_data), 0,
+				       (struct sockaddr *)&recv_sock->from,
+				       &sockaddr_size);
+	if (recv_sock->pkt_size < 0)
+		return;
+
+	if (!inet_ntop(AF_INET,
+		       &recv_sock->from.sin.sin_addr,
+		       recv_sock->from_str,
+		       sizeof(recv_sock->from_str)))
+		recv_sock->from_str[0] = '\0';
+	repeat_packet4(recv_sock);
+}
+
+static void
+recv_packet(struct recv_sock *recv_sock)
+{
+	switch (recv_sock->addr.ss.ss_family) {
+	case AF_INET:
+		recv_packet4(recv_sock);
+		break;
+	case AF_INET6:
+		recv_packet6(recv_sock);
+		break;
+	}
+}
+
 int main(int argc, char *argv[]) {
 	pid_t running_pid;
-	fd_set sockfd_set;
 	int r = 0;
+	struct send_sock6 *send_sock6, *tmp_send_sock6;
+	struct send_sock4 *send_sock4, *tmp_send_sock4;
+	struct recv_sock *recv_sock, *tmp_recv_sock;
+	struct addr_mask *am, *tmp_am;
+	int pfds_count = 0;
+	int pfds_used = 0;
+	struct pollfd *pfds;
 
 	parse_opts(argc, argv);
 
@@ -530,36 +1142,68 @@ int main(int argc, char *argv[]) {
 
 	openlog(PACKAGE, LOG_PID | LOG_CONS, LOG_DAEMON);
 
-	// create receiving socket
-	server_sockfd = create_recv_sock();
-	if (server_sockfd < 0) {
-		log_message(LOG_ERR, "unable to create server socket");
-		r = 1;
+	// create signal pipe pair
+	if (pipe(signal_pipe_fds) < 0) {
+		log_message(LOG_ERR, "pipe(): %s", strerror(errno));
 		goto end_main;
 	}
+	pfds_count++;
 
-	// create sending sockets
-	int i;
-	for (i = optind; i < argc; i++) {
-		if (num_socks >= MAX_SOCKS) {
-			log_message(LOG_ERR, "too many sockets (maximum is %d)", MAX_SOCKS);
-			exit(2);
-		}
-
-		int sockfd = create_send_sock(server_sockfd, argv[i], &socks[num_socks]);
-		if (sockfd < 0) {
-			log_message(LOG_ERR, "unable to create socket for interface %s", argv[i]);
+	// create receiving IPv6 sockets
+	if (!ipv4_only) {
+		recv_sock = create_recv_sock6();
+		if (!recv_sock) {
+			log_message(LOG_ERR, "unable to create server IPv6 socket");
 			r = 1;
 			goto end_main;
 		}
-		num_socks++;
+		list_add(&recv_sock->list, &recv_socks);
+		pfds_count++;
+	}
+
+	// create receiving IPv4 sockets
+	if (!ipv6_only) {
+		recv_sock = create_recv_sock4();
+		if (!recv_sock) {
+			log_message(LOG_ERR, "unable to create server IPv4 socket");
+			r = 1;
+			goto end_main;
+		}
+		list_add(&recv_sock->list, &recv_socks);
+		pfds_count++;
+	}
+
+	// create sending IPv6 sockets
+	if (!ipv4_only) {
+		for (int i = optind; i < argc; i++) {
+			send_sock6 = create_send_sock6(argv[i], &recv_socks);
+			if (!send_sock6) {
+				log_message(LOG_ERR, "unable to create IPv6 socket for interface %s", argv[i]);
+				r = 1;
+				goto end_main;
+			}
+			list_add(&send_sock6->list, &send_socks6);
+		}
+	}
+
+	// create sending IPv4 sockets
+	if (!ipv6_only) {
+		for (int i = optind; i < argc; i++) {
+			send_sock4 = create_send_sock4(argv[i], &recv_socks);
+			if (!send_sock4) {
+				log_message(LOG_ERR, "unable to create IPv4 socket for interface %s", argv[i]);
+				r = 1;
+				goto end_main;
+			}
+			list_add(&send_sock4->list, &send_socks4);
+		}
 	}
 
 	if (user) {
 		switch_user();
 	}
 
-	if (! foreground)
+	if (!foreground)
 		daemonize();
 	else {
 		// check for pid file when running in foreground
@@ -570,105 +1214,38 @@ int main(int argc, char *argv[]) {
 		}
 	}
 
-	pkt_data = malloc(PACKET_SIZE);
-	if (pkt_data == NULL) {
-		log_message(LOG_ERR, "cannot malloc() packet buffer: %s", strerror(errno));
+	pfds = xmalloc(pfds_count * sizeof(struct pollfd));
+	if (!pfds) {
 		r = 1;
 		goto end_main;
 	}
 
-	while (! shutdown_flag) {
-		struct timeval tv = {
-			.tv_sec = 10,
-			.tv_usec = 0,
-		};
+	pfds[pfds_used].fd = signal_pipe_fds[PIPE_RD];
+	pfds[pfds_used].events = POLLIN;
+	pfds_used++;
 
-		FD_ZERO(&sockfd_set);
-		FD_SET(server_sockfd, &sockfd_set);
-		int numfd = select(server_sockfd + 1, &sockfd_set, NULL, NULL, &tv);
-		if (numfd <= 0)
+	list_for_each_entry(recv_sock, &recv_socks, list) {
+		pfds[pfds_used].fd = recv_sock->sockfd;
+		pfds[pfds_used].events = POLLIN;
+		pfds_used++;
+	}
+
+	while (true) {
+		r = poll(pfds, pfds_used, -1);
+		if (r <= 0)
 			continue;
 
-		if (FD_ISSET(server_sockfd, &sockfd_set)) {
-			struct sockaddr_in fromaddr;
-			socklen_t sockaddr_size = sizeof(struct sockaddr_in);
+		if (pfds[0].revents & POLLIN)
+			break;
 
-			ssize_t recvsize = recvfrom(server_sockfd, pkt_data, PACKET_SIZE, 0,
-				(struct sockaddr *) &fromaddr, &sockaddr_size);
-			if (recvsize < 0) {
-				log_message(LOG_ERR, "recv(): %s", strerror(errno));
-			}
-
-			int j;
-			char discard = 0;
-			char our_net = 0;
-			for (j = 0; j < num_socks; j++) {
-				// make sure packet originated from specified networks
-				if ((fromaddr.sin_addr.s_addr & socks[j].mask.s_addr) == socks[j].net.s_addr) {
-					our_net = 1;
-				}
-
-				// check for loopback
-				if (fromaddr.sin_addr.s_addr == socks[j].addr.s_addr) {
-					discard = 1;
-					break;
-				}
-			}
-
-			if (discard || !our_net)
+		for (int i = 1; i < pfds_used; i++) {
+			if (!(pfds[i].revents & POLLIN))
 				continue;
 
-			if (num_whitelisted_subnets != 0) {
-				char whitelisted_packet = 0;
-				for (j = 0; j < num_whitelisted_subnets; j++) {
-					// check for whitelist
-					if ((fromaddr.sin_addr.s_addr & whitelisted_subnets[j].mask.s_addr) == whitelisted_subnets[j].net.s_addr) {
-						whitelisted_packet = 1;
-						break;
-					}
-				}
-
-				if (!whitelisted_packet) {
-					if (foreground)
-						printf("skipping packet from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
-					continue;
-				}
-			} else {
-				char blacklisted_packet = 0;
-				for (j = 0; j < num_blacklisted_subnets; j++) {
-					// check for blacklist
-					if ((fromaddr.sin_addr.s_addr & blacklisted_subnets[j].mask.s_addr) == blacklisted_subnets[j].net.s_addr) {
-						blacklisted_packet = 1;
-						break;
-					}
-				}
-
-				if (blacklisted_packet) {
-					if (foreground)
-						printf("skipping packet from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
-					continue;
-				}
-			}
-
-			if (foreground)
-				printf("data from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
-
-			for (j = 0; j < num_socks; j++) {
-				// do not repeat packet back to the same network from which it originated
-				if ((fromaddr.sin_addr.s_addr & socks[j].mask.s_addr) == socks[j].net.s_addr)
-					continue;
-
-				if (foreground)
-					printf("repeating data to %s\n", socks[j].ifname);
-
-				// repeat data
-				ssize_t sentsize = send_packet(socks[j].sockfd, pkt_data, (size_t) recvsize);
-				if (sentsize != recvsize) {
-					if (sentsize < 0)
-						log_message(LOG_ERR, "send(): %s", strerror(errno));
-					else
-						log_message(LOG_ERR, "send_packet size differs: sent=%zd actual=%zd",
-							recvsize, sentsize);
+			list_for_each_entry(recv_sock, &recv_socks, list) {
+				if (recv_sock->sockfd == pfds[i].fd) {
+					recv_packet(recv_sock);
+					break;
 				}
 			}
 		}
@@ -677,15 +1254,37 @@ int main(int argc, char *argv[]) {
 	log_message(LOG_INFO, "shutting down...");
 
 end_main:
+	list_for_each_entry_safe(recv_sock, tmp_recv_sock, &recv_socks, list) {
+		list_del(&recv_sock->list);
+		close(recv_sock->sockfd);
+		free(recv_sock);
+	}
 
-	if (pkt_data != NULL)
-		free(pkt_data);
+	list_for_each_entry_safe(send_sock6, tmp_send_sock6, &send_socks6, list) {
+		list_for_each_entry_safe(am, tmp_am, &send_sock6->ams, list) {
+			list_del(&am->list);
+			free(am);
+		}
+		list_del(&send_sock6->list);
+		close(send_sock6->sockfd);
+		free(send_sock6);
+	}
 
-	if (server_sockfd >= 0)
-		close(server_sockfd);
+	list_for_each_entry_safe(send_sock4, tmp_send_sock4, &send_socks4, list) {
+		list_del(&send_sock4->list);
+		close(send_sock4->sockfd);
+		free(send_sock4);
+	}
 
-	for (i = 0; i < num_socks; i++)
-		close(socks[i].sockfd);
+	list_for_each_entry_safe(am, tmp_am, &blacklisted_subnets, list) {
+		list_del(&am->list);
+		free(am);
+	}
+
+	list_for_each_entry_safe(am, tmp_am, &whitelisted_subnets, list) {
+		list_del(&am->list);
+		free(am);
+	}
 
 	// remove pid file if it belongs to us
 	if (already_running() == getpid())
