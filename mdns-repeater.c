@@ -1,6 +1,7 @@
 /*
  * mdns-repeater.c - mDNS repeater daemon
  * Copyright (C) 2011 Darell Tan
+ * Copyright (C) 2024 David Härdeman <david@hardeman.nu>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -111,6 +112,8 @@ struct recv_sock {
 LIST_HEAD(recv_socks);
 
 bool foreground = false;
+bool ipv4_only = false;
+bool ipv6_only = false;
 
 int signal_pipe_fds[2];
 #define PIPE_RD 0
@@ -676,25 +679,28 @@ static void switch_user() {
 	}
 }
 
-static void show_help(const char *progname) {
+static void
+show_help(const char *progname)
+{
 	fprintf(stderr, "mDNS repeater (version " HGVERSION ")\n");
-	fprintf(stderr, "Copyright (C) 2011 Darell Tan\n\n");
+	fprintf(stderr, "Copyright (C) 2011-2024 Darell Tan\n\n");
 
-	fprintf(stderr, "usage: %s [ -f ] <ifdev> ...\n", progname);
+	fprintf(stderr, "Usage: %s [options] <ifdev> ...\n", progname);
 	fprintf(stderr, "\n"
-					"<ifdev> specifies an interface like \"eth0\"\n"
-					"packets received on an interface is repeated across all other specified interfaces\n"
-					"maximum number of interfaces is 5\n"
-					"\n"
-					" flags:\n"
-					"	-f	runs in foreground for debugging\n"
-					"	-b	blacklist subnet (eg. 192.168.1.1/24)\n"
-					"	-w	whitelist subnet (eg. 192.168.1.1/24)\n"
-					"	-p	specifies the pid file path (default: " PIDFILE ")\n"
-					"	-u	run as this user (by name)\n"
-					"	-h	shows this help\n"
-					"\n"
-		);
+			"<ifdev> specifies an interface like \"eth0\"\n"
+			"Packets received on an interface is repeated across all other specified interfaces\n"
+			"\n"
+			"Options:\n"
+			"	-f	runs in foreground for debugging\n"
+			"	-b	blacklist subnet (eg. 192.168.1.1/24 or fc00::/7)\n"
+			"	-w	whitelist subnet (eg. 192.168.1.1/24 or fc00::/7)\n"
+			"	-p	specifies the pid file path (default: " PIDFILE ")\n"
+			"	-u	run as this user (by name)\n"
+			"	-4	use IPv4 only\n"
+			"	-6	use IPv6 only\n"
+			"	-h	shows this help\n"
+			"\n"
+	);
 }
 
 /*
@@ -833,12 +839,14 @@ subnet_match(union sockaddr_u *from, struct list_head *subnets)
 	return false;
 }
 
-static int parse_opts(int argc, char *argv[]) {
+static int
+parse_opts(int argc, char *argv[])
+{
 	int c;
 	bool help = false;
 	struct addr_mask *subnet;
 
-	while ((c = getopt(argc, argv, "hfp:b:w:u:")) != -1) {
+	while ((c = getopt(argc, argv, "hf46p:b:w:u:")) != -1) {
 		switch (c) {
 			case 'h':
 				help = true;
@@ -846,6 +854,14 @@ static int parse_opts(int argc, char *argv[]) {
 
 			case 'f':
 				foreground = true;
+				break;
+
+			case '4':
+				ipv4_only = true;
+				break;
+
+			case '6':
+				ipv6_only = true;
 				break;
 
 			case 'p':
@@ -876,18 +892,22 @@ static int parse_opts(int argc, char *argv[]) {
 				fputs("\n", stderr);
 				break;
 
-			case 'u': {
+			case 'u':
 				if ((user = getpwnam(optarg)) == NULL) {
 					log_message(LOG_ERR, "No such user '%s'", optarg);
 					exit(2);
 				}
 				break;
-			}
 
 			default:
 				log_message(LOG_ERR, "unknown option %c", optopt);
 				exit(2);
 		}
+	}
+
+	if (ipv4_only && ipv6_only) {
+		log_message(LOG_ERR, "simultaneous IPv4 and IPv6-only mode does not make sense");
+		exit(2);
 	}
 
 	if (!list_empty(&whitelisted_subnets) && !list_empty(&blacklisted_subnets)) {
@@ -1130,45 +1150,53 @@ int main(int argc, char *argv[]) {
 	pfds_count++;
 
 	// create receiving IPv6 sockets
-	recv_sock = create_recv_sock6();
-	if (!recv_sock) {
-		log_message(LOG_ERR, "unable to create server IPv6 socket");
-		r = 1;
-		goto end_main;
-	}
-	list_add(&recv_sock->list, &recv_socks);
-	pfds_count++;
-
-	// create receiving IPv4 sockets
-	recv_sock = create_recv_sock4();
-	if (!recv_sock) {
-		log_message(LOG_ERR, "unable to create server IPv4 socket");
-		r = 1;
-		goto end_main;
-	}
-	list_add(&recv_sock->list, &recv_socks);
-	pfds_count++;
-
-	// create sending IPv6 sockets
-	for (int i = optind; i < argc; i++) {
-		send_sock6 = create_send_sock6(argv[i], &recv_socks);
-		if (!send_sock6) {
-			log_message(LOG_ERR, "unable to create IPv6 socket for interface %s", argv[i]);
+	if (!ipv4_only) {
+		recv_sock = create_recv_sock6();
+		if (!recv_sock) {
+			log_message(LOG_ERR, "unable to create server IPv6 socket");
 			r = 1;
 			goto end_main;
 		}
-		list_add(&send_sock6->list, &send_socks6);
+		list_add(&recv_sock->list, &recv_socks);
+		pfds_count++;
+	}
+
+	// create receiving IPv4 sockets
+	if (!ipv6_only) {
+		recv_sock = create_recv_sock4();
+		if (!recv_sock) {
+			log_message(LOG_ERR, "unable to create server IPv4 socket");
+			r = 1;
+			goto end_main;
+		}
+		list_add(&recv_sock->list, &recv_socks);
+		pfds_count++;
+	}
+
+	// create sending IPv6 sockets
+	if (!ipv4_only) {
+		for (int i = optind; i < argc; i++) {
+			send_sock6 = create_send_sock6(argv[i], &recv_socks);
+			if (!send_sock6) {
+				log_message(LOG_ERR, "unable to create IPv6 socket for interface %s", argv[i]);
+				r = 1;
+				goto end_main;
+			}
+			list_add(&send_sock6->list, &send_socks6);
+		}
 	}
 
 	// create sending IPv4 sockets
-	for (int i = optind; i < argc; i++) {
-		send_sock4 = create_send_sock4(argv[i], &recv_socks);
-		if (!send_sock4) {
-			log_message(LOG_ERR, "unable to create IPv4 socket for interface %s", argv[i]);
-			r = 1;
-			goto end_main;
+	if (!ipv6_only) {
+		for (int i = optind; i < argc; i++) {
+			send_sock4 = create_send_sock4(argv[i], &recv_socks);
+			if (!send_sock4) {
+				log_message(LOG_ERR, "unable to create IPv4 socket for interface %s", argv[i]);
+				r = 1;
+				goto end_main;
+			}
+			list_add(&send_sock4->list, &send_socks4);
 		}
-		list_add(&send_sock4->list, &send_socks4);
 	}
 
 	if (user) {
