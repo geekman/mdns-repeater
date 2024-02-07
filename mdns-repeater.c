@@ -783,6 +783,24 @@ out:
 }
 
 static bool
+same_address(union sockaddr_u *a, union sockaddr_u *b)
+{
+	if (a->ss.ss_family != b->ss.ss_family)
+		return false;
+
+	switch (a->ss.ss_family) {
+	case AF_INET6:
+		return IN6_ARE_ADDR_EQUAL(&a->sin6.sin6_addr,
+					  &b->sin6.sin6_addr);
+	case AF_INET:
+		return (a->sin.sin_addr.s_addr ==
+			b->sin.sin_addr.s_addr);
+	default:
+		return false;
+	}
+}
+
+static bool
 same_network(union sockaddr_u *addr, struct addr_mask *addr_mask)
 {
 	if (addr->ss.ss_family != addr_mask->addr.ss.ss_family)
@@ -896,8 +914,7 @@ repeat_packet6(struct recv_sock *recv_sock, unsigned ifindex)
 
 	list_for_each_entry(send_sock, &send_socks6, list) {
 		list_for_each_entry(am, &send_sock->ams, list) {
-			if (IN6_ARE_ADDR_EQUAL(&recv_sock->from.sin6.sin6_addr,
-					       &am->addr.sin6.sin6_addr)) {
+			if (same_address(&recv_sock->from, &am->addr)) {
 				if (foreground)
 					printf("skipping packet from=%s size=%zd (ourself)\n",
 					       recv_sock->from_str, recv_sock->pkt_size);
@@ -954,7 +971,7 @@ repeat_packet4(struct recv_sock *recv_sock) {
 			our_net = true;
 
 		// check for loopback
-		if (recv_sock->from.sin.sin_addr.s_addr == send_sock->am.addr.sin.sin_addr.s_addr)
+		if (same_address(&recv_sock->from, &send_sock->am.addr))
 			return;
 	}
 
