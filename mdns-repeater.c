@@ -139,6 +139,17 @@ void log_message(int loglevel, char *fmt_str, ...) {
 	}
 }
 
+static void *
+xmalloc(size_t size)
+{
+	void *tmp;
+
+	tmp = calloc(1, size);
+	if (!tmp)
+		log_message(LOG_ERR, "malloc(): %s", strerror(errno));
+	return tmp;
+}
+
 static char *
 addr6_mask_to_string(struct sockaddr_in6 *addr,
 		     struct in6_addr *mask,
@@ -202,11 +213,9 @@ create_recv_sock6() {
 	int sd;
 	int on = 1;
 
-	sock = malloc(sizeof(*sock));
-	if (!sock) {
-		log_message(LOG_ERR, "malloc(): %s", strerror(errno));
+	sock = xmalloc(sizeof(*sock));
+	if (!sock)
 		goto out;
-	}
 
 	sd = socket(AF_INET6, SOCK_DGRAM, 0);
 	if (sd < 0) {
@@ -240,7 +249,6 @@ create_recv_sock6() {
 	}
 
 	// bind to an address
-	memset(&sock->addr, 0, sizeof(sock->addr));
 	sock->addr.sin6.sin6_family = AF_INET6;
 	sock->addr.sin6.sin6_port = htons(MDNS_PORT);
 	sock->addr.sin6.sin6_addr = in6addr_any;
@@ -262,11 +270,9 @@ create_recv_sock4() {
 	int sd;
 	int on = 1;
 
-	sock = malloc(sizeof(*sock));
-	if (!sock) {
+	sock = xmalloc(sizeof(*sock));
+	if (!sock)
 		log_message(LOG_ERR, "malloc(): %s", strerror(errno));
-		goto out;
-	}
 
 	sd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (sd < 0) {
@@ -282,7 +288,6 @@ create_recv_sock4() {
 	}
 
 	// bind to an address
-	memset(&sock->addr, 0, sizeof(sock->addr));
 	sock->addr.sin.sin_family = AF_INET;
 	sock->addr.sin.sin_port = htons(MDNS_PORT);
 	sock->addr.sin.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -330,12 +335,10 @@ create_send_sock6(const char *ifname, struct list_head *recv_socks) {
 		goto out;
 	}
 
-	sock = malloc(sizeof(*sock));
-	if (!sock) {
-		log_message(LOG_ERR, "malloc(): %s", strerror(errno));
+	sock = xmalloc(sizeof(*sock));
+	if (!sock)
 		goto out;
-	}
-	memset(sock, 0, sizeof(*sock));
+
 	INIT_LIST_HEAD(&sock->ams);
 	sock->ifname = ifname;
 	sock->ifindex = ifindex;
@@ -355,12 +358,9 @@ create_send_sock6(const char *ifname, struct list_head *recv_socks) {
 		else if (strcmp(ifa->ifa_name, ifname))
 			continue;
 
-		am = malloc(sizeof(*am));
-		if (!am) {
-			log_message(LOG_ERR, "malloc(): %s", strerror(errno));
+		am = xmalloc(sizeof(*am));
+		if (!am)
 			goto out;
-		}
-		memset(am, 0, sizeof(*am));
 
 		am->addr.ss.ss_family = AF_INET6;
 		am->addr.sin6.sin6_port = htons(MDNS_PORT);
@@ -470,12 +470,10 @@ create_send_sock4(const char *ifname, struct list_head *recv_socks) {
 	struct ip_mreq mreq;
 	struct recv_sock *recv_sock;
 
-	sock = malloc(sizeof(*sock));
-	if (!sock) {
-		log_message(LOG_ERR, "malloc(): %s", strerror(errno));
+	sock = xmalloc(sizeof(*sock));
+	if (!sock)
 		goto out;
-	}
-	memset(sock, 0, sizeof(*sock));
+
 	sock->ifname = ifname;
 
 	sd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -492,7 +490,7 @@ create_send_sock4(const char *ifname, struct list_head *recv_socks) {
 		log_message(LOG_ERR, "ioctl(SIOCGIFNETMASK): %s", strerror(errno));
 		goto out;
 	}
-	memcpy(&sock->am.mask.in, if_addr, sizeof(*if_addr));
+	sock->am.mask.in = *if_addr;
 
 	// ...and interface address
 	if (ioctl(sd, SIOCGIFADDR, &ifr) < 0) {
@@ -713,12 +711,9 @@ parse_subnet(const char *input) {
 	struct in_addr *addr_in;
 	int prefix_len;
 
-	subnet = malloc(sizeof(*subnet));
-	if (!subnet) {
-		log_message(LOG_ERR, "malloc(): %s", strerror(errno));
+	subnet = xmalloc(sizeof(*subnet));
+	if (!subnet)
 		goto out;
-	}
-	memset(subnet, 0, sizeof(*subnet));
 
 	addr_str = strdup(input);
 	if (!addr_str) {
@@ -1191,9 +1186,8 @@ int main(int argc, char *argv[]) {
 		}
 	}
 
-	pfds = calloc(pfds_count, sizeof(struct pollfd));
+	pfds = xmalloc(pfds_count * sizeof(struct pollfd));
 	if (!pfds) {
-		log_message(LOG_ERR, "malloc(): %s", strerror(errno));
 		r = 1;
 		goto end_main;
 	}
