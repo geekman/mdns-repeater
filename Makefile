@@ -15,7 +15,7 @@ ifdef DEBUG
 CFLAGS += -g
 endif
 
-CFLAGS += -DHGVERSION="\"${HGVERSION}\""
+CPPFLAGS += -DHGVERSION="\"${HGVERSION}\""
 
 .PHONY: all clean
 
