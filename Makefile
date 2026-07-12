@@ -9,16 +9,13 @@ ZIP_FILES = mdns-repeater	\
 
 HGVERSION=$(shell git rev-parse HEAD )
 
-CFLAGS=-Wall
+CFLAGS += -Wall
 
 ifdef DEBUG
-CFLAGS+= -g
-else
-CFLAGS+= -Os
-LDFLAGS+= -s
+CFLAGS += -g
 endif
 
-CFLAGS+= -DHGVERSION="\"${HGVERSION}\""
+CFLAGS += -DHGVERSION="\"${HGVERSION}\""
 
 .PHONY: all clean
 
