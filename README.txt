@@ -1,17 +1,21 @@
 mdns-repeater
 ==============
 mdns-repeater is a Multicast DNS repeater for Linux. Multicast DNS uses the 
-224.0.0.251 address, which is "administratively scoped" and does not 
-leave the subnet.
+224.0.0.251 (IPv4) and ff02::fb (IPv6) addresses, which are "administratively
+scoped" and do not leave the subnet.
 
 This program re-broadcast mDNS packets from one interface to other interfaces.
 It was written primarily to be run on my Linksys WRT54G which runs dd-wrt,
 since my wireless network is on a different subnet from my wired network and 
 I would like my zeroconf devices to work properly across the two subnets.
 
-Since the mDNS protocol sends the AA records in the packet itself, the 
+Since the mDNS protocol sends the A records in the packet itself, the
 repeater does not need to forge the source address. Instead, the source 
 address is of the interface that repeats the packet.
+
+For IPv6, some devices send AAAA records containing a link-local address.
+The repeater does currently not change such records, meaning that hosts
+might be advertised with unreachable addresses.
 
 
 USAGE
@@ -32,6 +36,7 @@ long as you abide by the software license.
 LICENSE
 --------
 Copyright (C) 2011 Darell Tan
+Copyright (C) 2024 David Härdeman <david@hardeman.nu>
 
 This program is free software; you can redistribute it and/or
 modify it under the terms of the GNU General Public License

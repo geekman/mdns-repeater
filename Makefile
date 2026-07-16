@@ -21,7 +21,7 @@ CPPFLAGS += -DHGVERSION="\"${HGVERSION}\""
 
 all: mdns-repeater
 
-mdns-repeater.o: _hgversion
+mdns-repeater.o: _hgversion list.h
 
 mdns-repeater: mdns-repeater.o
 

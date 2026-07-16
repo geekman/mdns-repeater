@@ -1,0 +1,4 @@
+*.o
+_hgversion
+mdns-repeater
+mdns-repeater-*.zip
