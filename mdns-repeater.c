@@ -46,6 +46,10 @@
 #define MAX_SOCKS 16
 #define MAX_SUBNETS 16
 
+#ifndef HGVERSION
+#define HGVERSION "unknown"
+#endif
+
 struct if_sock {
 	const char *ifname;	/* interface name  */
 	int sockfd;		/* socket filedesc */
